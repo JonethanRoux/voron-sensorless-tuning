@@ -404,7 +404,8 @@ on hardware.
 | Printer | Voron 2.4 r2, 300mm |
 | Kinematics | **CoreXY only** |
 | Board | BTT Kraken, TMC5160 on X and Y |
-| Motors | LDO-42STH48-2004MAH, 0.9 degree, 2.0A peak, 48V on XY |
+| Motors | LDO-42STH48-2004MAH, 0.9 degree, 2.0A peak |
+| **Supply** | **48V rail on X and Y** - see the note below, this matters |
 | Klipper | v0.13.0-743 |
 | Host | Debian 13 (trixie), Python 3.13.5 |
 | Moonraker | default, `localhost:7125` |
@@ -449,9 +450,26 @@ hold 1.0A, `rotation_distance` 40 with 400 full steps per rotation.
 
   I will do this myself once the panels are on, and update the repo with what
   I find - good or bad.
-- **Any board other than the Kraken**, any motor other than the one above, and
-  any voltage other than 48V on XY. Current and speed both scale back-EMF, so a
-  different motor or supply voltage changes what every threshold means.
+- **Any supply voltage other than 48V.** X and Y run on a **48V rail** here,
+  and that is not a detail - it is one of the main reasons a threshold from
+  one machine will not transfer to another.
+
+  Higher rail voltage drives current into the windings faster, so the motor
+  holds torque to a higher speed and the load signature StallGuard reads is
+  different. A 24V machine - which is the more common Voron build - will
+  likely need a different threshold, and quite possibly a lower
+  `homing_speed`, because it cannot sustain torque as far up the speed range.
+  The `homing_speed` values here (78 for X, 100 for Y) may simply not be
+  reachable usefully at 24V.
+
+  So treat every number in this repo as a starting point for the sweep, not
+  as a value to copy. That is what the sweep is for.
+
+- **Any board other than the Kraken, or any other motor.** Current and motor
+  characteristics both scale back-EMF, so a different motor changes what every
+  threshold means. Note also that TMC2209 boards are typically 24V while these
+  TMC5160s are on 48V, so the untested StallGuard4 path differs from the
+  tested setup in *two* ways at once, not one.
 - **Long-term use.** This was written and used over a few days. It has not run
   across firmware upgrades or seen a large sample of prints.
 
