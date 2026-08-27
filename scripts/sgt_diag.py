@@ -683,6 +683,7 @@ def distances(rig, dists, chain=True, runs=10):
     from the previous touch, and from the far end the axis builds momentum."""
     rig.banner()
     rig.set_sgt(rig.sgt_cfg)
+    errs = []
     say('  homing from %s mm off the rail' % dists)
     say()
     rig.one_home()
@@ -713,13 +714,53 @@ def distances(rig, dists, chain=True, runs=10):
             'NO TRIGGER' if not ok else 'OFF by %+.1fmm' % err)
         if verdict != 'OK':
             bad.append(d)
+        errs.append(err)
         say('  start %6.1fmm off rail -> travel %7.1fmm (expected %6.1f)   %s'
             % (d, travel, d, verdict))
     say()
     note('-- home range --')
     note('from %s mm off the rail' % dists)
-    if bad:
+    # A CONSTANT error at every distance cannot be a homing fault. Homing from
+    # 5mm and from 250mm share nothing except the starting reference, so if both
+    # are wrong by the same amount it is the reference that is wrong - the axis
+    # was declared at a position it was not physically at. Reporting that as a
+    # failure and sending the user to raise unload_dist is worse than useless:
+    # it blames a setting that is not involved and hides the real cause.
+    # Judge uniformity only on distances BEYOND unload_dist. At or below it the
+    # macro adds a pre-home backoff, so those points carry an extra offset by
+    # design and would mask an otherwise clean constant error.
+    try:
+        _v = query('gcode_macro _SENSORLESS_VARS')['gcode_macro _SENSORLESS_VARS']
+        _unload = float(_v.get('unload_dist', 0) or 0)
+    except Exception:
+        _unload = 0.0
+    clean = [e for d, e in zip(dists, errs) if d > _unload]
+    if len(clean) < 3:
+        clean = errs
+    err_spread = (max(clean) - min(clean)) if clean else 0.0
+    err_mean = (sum(clean) / len(clean)) if clean else 0.0
+    uniform = len(clean) >= 3 and err_spread < 4.0 and abs(err_mean) > 3.0
+    if bad and uniform:
+        note('OFFSET  every distance out by ~%+.1fmm - NOT a homing fault'
+             % err_mean)
+        note('the axis homed correctly each time. The STARTING')
+        note('reference was wrong by that much.')
+        if rig.axis == 'Y':
+            note('DO    re-centre the head by hand, then run again')
+            note('      Y is declared, never measured - a placement')
+            note('      %.0fmm out shifts every result by %.0fmm'
+                 % (abs(err_mean), abs(err_mean)))
+        else:
+            note('DO    check position_max, and that nothing moved')
+            note('      the axis between homing and the test')
+        say('  Every distance is out by about %+.1fmm - a CONSTANT error.' % err_mean)
+        say('  Homing from 5mm and from 250mm have nothing in common except the')
+        say('  starting reference, so that is what is wrong, not the axis. The')
+        say('  homes themselves were fine.')
+    elif bad:
         note('FAIL  at %s' % bad)
+        note('errors %s vary, so this is the axis'
+             % [round(e, 1) for e in errs])
         note('DO    raise unload_dist in _SENSORLESS_VARS')
         say('  FAILED from these distances: %s' % bad)
         say('  Close to the rail usually means StallGuard is still loaded from the')
