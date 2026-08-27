@@ -21,6 +21,22 @@ Driver-agnostic: it detects which StallGuard generation is fitted and adapts.
 > gantry, and you have no way to tell them apart. With it, only the Y rails
 > and the gantry mass are left. Doing Y first throws that away.
 
+> ## Use at your own risk
+>
+> **This software deliberately drives your toolhead into the frame, on
+> purpose, repeatedly.** That is how it finds the limits of the working range.
+> Belts can skip, printed parts can crack, and a wrong setting can do worse.
+>
+> It is provided as-is, with no warranty of any kind. **The author accepts no
+> liability for any damage, injury or loss** arising from its use - to your
+> printer, your parts, your prints, or anything else. You run it on your own
+> machine, at your own risk, and you are responsible for supervising it.
+>
+> Read [Before you run this](#before-you-run-this) and
+> [What has actually been tested](#what-has-actually-been-tested) first. If
+> you are not comfortable standing over the machine with a hand on the
+> emergency stop while it crashes into a rail, do not use this.
+
 ## Why a threshold that "works" often isn't tuned
 
 A single successful home proves very little. A false trigger also reports
@@ -480,7 +496,8 @@ produced roughly 150mm of a motor fighting the stop. Belts can skip, printed
 parts can crack, and a badly wrong config could do worse. Stay on the
 emergency stop for the whole run.
 
-No warranty. See the licence. If it breaks your machine, that is on you.
+No warranty, and no liability - see the disclaimer at the top and the MIT
+licence at the bottom. If it breaks your machine, that is on you.
 
 ## Contributing
 
