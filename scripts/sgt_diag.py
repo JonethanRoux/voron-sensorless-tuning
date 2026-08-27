@@ -190,35 +190,55 @@ def query(objs):
         return json.load(r)['result']['status']
 
 
-def mcu_steps():
-    """Raw MCU step counters: monotonic, NOT reset by homing.
-    The 'stepper:' line reads 0.000 until an axis is homed, so it is useless here."""
+def mcu_steps(timeout=6.0):
+    """Raw MCU step counters, guaranteed FRESH.
+
+    This used to post GET_POSITION, sleep a fixed second, then take the newest
+    'mcu:' line in the gcode store. When the response had not landed yet it
+    silently returned the PREVIOUS reading, so a measurement was computed
+    against a baseline from an earlier moment. On a rail measurement that made
+    the start counter identical run after run while the end counter advanced,
+    adding a clean 640 steps - exactly 2.00mm - to every successive result. The
+    numbers looked plausible and drifted monotonically, which is the worst way
+    for a measurement bug to present.
+
+    So: note the newest store timestamp BEFORE asking, then poll until an
+    'mcu:' line NEWER than that appears. If none arrives, raise rather than
+    return something stale - a wrong number here silently corrupts every
+    distance the tool reports.
+    """
+    def newest_time():
+        try:
+            with urllib.request.urlopen(BASE + '/server/gcode_store?count=1',
+                                        timeout=10) as r:
+                st = json.load(r)['result']['gcode_store']
+                return st[-1]['time'] if st else 0.0
+        except Exception:
+            return 0.0
+
+    mark = newest_time()
     post('GET_POSITION')
-    time.sleep(1.0)
-    with urllib.request.urlopen(BASE + '/server/gcode_store?count=25', timeout=15) as r:
-        for m in reversed(json.load(r)['result']['gcode_store']):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.15)
+        try:
+            with urllib.request.urlopen(BASE + '/server/gcode_store?count=25',
+                                        timeout=10) as r:
+                store = json.load(r)['result']['gcode_store']
+        except Exception:
+            continue
+        for m in reversed(store):
+            if m.get('time', 0) <= mark:
+                continue            # older than our request - not our answer
             hit = re.search(r'mcu:\s*(.*)', m['message'])
             if hit:
                 d = dict(re.findall(r'(stepper_\w+):(-?\d+)', hit.group(1)))
                 if 'stepper_x' in d:
                     return int(d['stepper_x']), int(d['stepper_y'])
-    raise RuntimeError('could not read GET_POSITION mcu line')
+    raise RuntimeError('GET_POSITION did not return a fresh mcu line in %.0fs'
+                       % timeout)
 
 
-
-# ---------------------------------------------------------------------------
-# StallGuard varies by driver generation. The two families use different field
-# names, different ranges, and OPPOSITE sensitivity directions - which is why a
-# working SGTHRS from a TMC2209 machine is meaningless on a TMC5160.
-#
-#   StallGuard2  tmc2130 / tmc2660 / tmc5160 (and tmc2160)
-#       field 'sgt', range -64..63, LOWER = MORE sensitive, needs spreadCycle
-#   StallGuard4  tmc2209 (sgthrs) / tmc2240 (sg4_thrs)
-#       range 0..255, HIGHER = MORE sensitive, SG4 needs stealthChop
-#
-# tmc2240 carries both: Klipper uses the SG4 path when sg4_thrs is non-zero,
-# otherwise it falls back to SG2 via sgt.
-# ---------------------------------------------------------------------------
 SG_SPEC = {
     'tmc2130': ('sgt',      -64, 63,  -1),
     'tmc2660': ('sgt',      -64, 63,  -1),
@@ -740,6 +760,8 @@ def distances(rig, dists, chain=True, runs=10):
     err_spread = (max(clean) - min(clean)) if clean else 0.0
     err_mean = (sum(clean) / len(clean)) if clean else 0.0
     uniform = len(clean) >= 3 and err_spread < 4.0 and abs(err_mean) > 3.0
+    rig.last_errs = list(errs)
+    rig.last_bad = list(bad)
     if bad and uniform:
         note('OFFSET  every distance out by ~%+.1fmm - NOT a homing fault'
              % err_mean)
@@ -795,7 +817,19 @@ def measure_axis(rig, runs=10):
         % (claimed, pmin, rig.pos_max))
     say('  measuring the real rail-to-rail distance over %d runs' % runs)
     say()
+    ##  Two establishing homes, not one. The first anchors the frame to a real
+    ##  rail contact; the second guarantees the move to position_min that
+    ##  follows starts from a position that is actually true. With only one, the
+    ##  first measurement inherits whatever frame the previous test left behind
+    ##  and reads ~135mm short while every later run is exact.
     rig.one_home()
+    ##  We have just touched the rail, so the position is KNOWN - not inferred.
+    ##  State it outright rather than letting correct_frame guess from a p0 that
+    ##  may itself be inherited wrong. Without this the first measurement reads
+    ##  ~135mm short while every later one is exact, because each subsequent
+    ##  home re-anchors the frame the hard way.
+    post('SET_KINEMATIC_POSITION %s=%.3f' % (rig.axis, rig.pos_max - rig.backoff))
+    time.sleep(0.4)
     res = []
     for i in range(1, runs + 1):
         rig.ensure_frame()
@@ -817,7 +851,14 @@ def measure_axis(rig, runs=10):
         rig.at_rail = ok
         raw = (da + db) / 2.0 if rig.axis == 'X' else (da - db) / 2.0
         travel = raw * rig.step_dist + rig.backoff
-        correct_frame(rig, p0, raw)
+        ##  NO correct_frame here. Every iteration ends on a real rail contact,
+        ##  so the home itself anchors the frame - there is nothing to correct.
+        ##  Calling it anyway was the bug: it compared this run's travel against
+        ##  the expected full-length travel, judged the home false, and rewrote
+        ##  the position to a value ~135mm short. The next G1 to position_min
+        ##  then started from that fiction, so the head never reached the front,
+        ##  the following home travelled less, and the error compounded - a
+        ##  clean +2mm per run that looked like a physical measurement.
         res.append(travel)
         say('  run %d/%d: rail-to-rail %7.2fmm   %s'
             % (i, runs, travel, 'measured' if ok else 'NO TRIGGER'))
@@ -1134,6 +1175,93 @@ def failure_advice(axis, rig, why):
     note('   whole gantry mass it alone has to drag.')
 
 
+def set_var(name, value):
+    post('SET_GCODE_VARIABLE MACRO=_SENSORLESS_VARS VARIABLE=%s VALUE=%s'
+         % (name, value))
+    time.sleep(0.3)
+
+
+def compare_homing(axis, dists, second_mm, unload_mm):
+    """Run the home-range test under each runway strategy and show them together.
+
+    The claim being tested: a blind pre-home backoff (unload_dist) and a second
+    homing move (second_home_dist) both exist to give StallGuard runway, but only
+    the homing move is monitored and can stop on contact. This measures whether
+    either actually fixes the close-in distances, rather than asking anyone to
+    take it on trust.
+
+    Restores whatever the variables were on the way out, including after a
+    failure, so a comparison run cannot leave the machine configured oddly.
+    """
+    v = query('gcode_macro _SENSORLESS_VARS')['gcode_macro _SENSORLESS_VARS']
+    was_second = float(v.get('second_home_dist', 0) or 0)
+    was_unload = float(v.get('unload_dist', 0) or 0)
+
+    combos = [
+        ('neither      ', 0, 0),
+        ('unload only  ', 0, unload_mm),
+        ('2nd home only', second_mm, 0),
+        ('both         ', second_mm, unload_mm),
+    ]
+    results = []
+    try:
+        for label, sec, unl in combos:
+            set_var('second_home_dist', sec)
+            set_var('unload_dist', unl)
+            rig = Rig(axis)
+            say()
+            say('  === %s   second_home=%g  unload=%g ===' % (label.strip(), sec, unl))
+            if axis == 'Y':
+                okx, why = require_x_calibrated()
+                if not okx:
+                    say('  ' + why)
+                    break
+            mark = len(SUMMARY)
+            try:
+                distances(rig, dists, chain=False)
+                errs = getattr(rig, 'last_errs', [])
+                bad = getattr(rig, 'last_bad', [])
+            except Exception as exc:
+                say('  combination failed: %s' % exc)
+                errs, bad = [], list(dists)
+            del SUMMARY[mark:]
+            worst = max([abs(e) for e in errs]) if errs else float('nan')
+            results.append((label, sec, unl, errs, bad, worst))
+            say('  -> worst error %.1fmm, failed at %s'
+                % (worst, bad if bad else 'nothing'))
+            park_centre(rig)
+    finally:
+        set_var('second_home_dist', was_second)
+        set_var('unload_dist', was_unload)
+        say()
+        say('  restored second_home_dist=%g unload_dist=%g' % (was_second, was_unload))
+
+    note('-- homing strategy comparison --')
+    note('distances %s' % dists)
+    note('')
+    for label, sec, unl, errs, bad, worst in results:
+        note('%s worst %5.1fmm  fails %s'
+             % (label, worst, len(bad)))
+    note('')
+    clean = [r for r in results if not r[4]]
+    if not clean:
+        note('FAIL  no strategy homed correctly from every distance')
+        note('DO    the runway is not the problem - see the sweep advice')
+    else:
+        # Prefer the safest that works: a homing move stops on contact, a blind
+        # G1 does not, so if both pass, the second home is the better answer.
+        order = {'2nd home only': 0, 'both         ': 1, 'unload only  ': 2,
+                 'neither      ': 3}
+        clean.sort(key=lambda r: (order.get(r[0], 9), r[5]))
+        best = clean[0]
+        note('BEST  %s (worst %.1fmm)' % (best[0].strip(), best[5]))
+        if best[0].strip() == 'neither':
+            note('this axis needs no runway help at all')
+        elif 'unload' in best[0] and '2nd' not in best[0]:
+            note('WARN  unload works here but is a BLIND move - it cannot')
+            note('      stop on contact and drives on a possibly wrong frame')
+
+
 def report_matrix(axis, results):
     ok = [r for r in results if r['width'] > 0]
     note('-- parameter matrix --')
@@ -1269,6 +1397,25 @@ def main():
         runs = int(args[i + 1]) if len(args) > i + 1 else 10
         measure_axis(Rig(axis), runs)
         title = 'SUMMARY - %s RAIL MEASURE' % axis.upper()
+    elif '--compare' in args:
+        i = args.index('--compare')
+        axis = next((a.upper() for a in args if a.upper() in ('X', 'Y')), 'X')
+        nums = []
+        for tok in args[i + 1:]:
+            try:
+                nums.append(float(tok))
+            except ValueError:
+                break
+        second_mm = nums[0] if len(nums) > 0 else 40.0
+        unload_mm = nums[1] if len(nums) > 1 else 40.0
+        ds = [5.0, 15.0, 40.0, 120.0, 250.0]
+        say('  comparing runway strategies on %s' % axis)
+        say('  second_home_dist=%g  unload_dist=%g  distances %s'
+            % (second_mm, unload_mm, ds))
+        say('  4 combinations x %d homes - this takes a while.' % len(ds))
+        say()
+        compare_homing(axis, ds, second_mm, unload_mm)
+        title = 'SUMMARY - %s HOMING STRATEGY' % axis
     elif '--matrix' in args:
         i = args.index('--matrix')
         axis = next((a.upper() for a in args if a.upper() in ('X', 'Y')), 'Y')
