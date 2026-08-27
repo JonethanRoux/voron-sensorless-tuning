@@ -110,9 +110,14 @@ are not obvious from the error message.
 or copy `gcode_shell_command.py` into `~/klipper/klippy/extras/`. Without it
 Klipper refuses the config with `Unknown config object 'gcode_shell_command'`.
 
-**2. `[force_move]` with `enable_force_move: True`** - required, and this is
-the one that catches people out. In current Klipper, `SET_KINEMATIC_POSITION`
-is registered *inside* that guard:
+**2. `[force_move]` with `enable_force_move: True`** - **shipped for you** in
+`sensorless_tools.cfg`, so normally you need do nothing. But **delete that
+block if you already declare `[force_move]` elsewhere** - Klipper aborts on a
+duplicate section, and many Voron configs already have it for `STEPPER_BUZZ`.
+One definition serves the whole printer.
+
+It is required because in current Klipper `SET_KINEMATIC_POSITION` is
+registered *inside* that guard:
 
 ```python
 self._enable_force_move = config.getboolean("enable_force_move", False)
@@ -120,13 +125,7 @@ if self._enable_force_move:
     gcode.register_command('SET_KINEMATIC_POSITION', ...)
 ```
 
-The tools use it to reconcile the coordinate frame after a false trigger. Add
-to `printer.cfg`:
-
-```
-[force_move]
-enable_force_move: True
-```
+The tools use it to reconcile the coordinate frame after a false trigger.
 
 **3. `[respond]`** - every result is reported with `RESPOND`. Add the bare
 section to `printer.cfg` if you do not already have it.
