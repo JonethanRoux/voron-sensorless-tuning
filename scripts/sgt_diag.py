@@ -1,0 +1,1330 @@
+#!/usr/bin/env python3
+"""
+Sensorless homing diagnostic for the Voron.
+
+Sweeps driver_SGT for one axis, measuring the ACTUAL homing travel from raw MCU
+step counts, and classifies every value: early-stop / reached-rail / no-trigger.
+Also does repeat-run verification of a chosen value.
+
+Why this is a script and NOT a Klipper macro:
+  * a macro's gcode is rendered BEFORE it executes, so it cannot branch on a
+    value it measured earlier in the same macro
+  * a failed G28 aborts the whole macro, so a macro cannot record "no trigger"
+    and continue to the next value
+  * MCU step counts are only reachable via GET_POSITION console output
+
+Usage:
+    python3 ~/sgt_diag.py                  sweep X with defaults
+    python3 ~/sgt_diag.py Y                sweep Y
+    python3 ~/sgt_diag.py X -10 20 2       axis, from, to, step
+    python3 ~/sgt_diag.py X --verify 0 5   5 repeat runs at SGT=0
+"""
+import json
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+BASE = 'http://localhost:7125'
+
+
+def post(script, timeout=300):
+    # quote(), not a naive space swap: RESPOND text contains - > % ( ) etc
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            BASE + '/printer/gcode/script?script=' + urllib.parse.quote(script),
+            method='POST'), timeout=timeout).read()
+    except urllib.error.HTTPError as e:
+        # Moonraker reports the status line ('400: Unknown') and drops Klipper's
+        # actual complaint into the body, so an unread body turns every real
+        # fault into a useless message. Read it and carry it on the exception -
+        # still an HTTPError, so callers that treat one as 'no trigger' are
+        # unaffected.
+        try:
+            body = e.read().decode('utf-8', 'replace')[:400]
+        except Exception:
+            body = ''
+        if body:
+            e.msg = '%s | klipper said: %s' % (e.msg, body)
+            print('  [gcode error] %s -> %s' % (script[:60], body))
+            sys.stdout.flush()
+        raise
+
+
+# Set once X has actually homed. On CoreXY an X move turns BOTH motors through
+# BOTH belts, so a passing X is hard evidence that the motors, belts, pulleys and
+# grub screws are all sound - and it makes the stock "check your belts" advice
+# actively misleading for a Y failure. Only the parts Y does NOT share with X can
+# still be at fault: the Y linear rails, and the gantry it alone has to drag.
+X_PROVEN = False
+
+SUMMARY_FILE = '/home/voron24/printer_data/logs/sgt_summary.txt'
+SUMMARY = []
+
+
+def note(line=''):
+    """Collect a line for the final summary block.
+
+    Klipper echoes every GET_POSITION (a 7-line dump) and every
+    SET_TMC_CURRENT, and neither can be silenced - they are Klipper
+    responding, not us. During a run that noise buries anything we print.
+    So findings are ALSO collected here and posted as one block at the very
+    end, after all motion, where nothing can scroll them away.
+    """
+    SUMMARY.append(line)
+
+
+def flush_summary(title):
+    """Post the collected findings as one clean block, and save it so
+    SHOW_SGT_RESULT can recall it later without re-running anything."""
+    # Mainsail's console panel is narrow. Anything past ~42 characters wraps
+    # onto a second line and the block looks broken, so keep every line short.
+    # 40 chars max per line: Mainsail's console panel wraps beyond about 42.
+    # This is posted AFTER M84, so no further motion output can push it up -
+    # it is always the last thing in the console.
+    bar = '-' * 40
+    passes = len([l for l in SUMMARY if l.startswith(('PASS', 'MATCH'))])
+    fails = len([l for l in SUMMARY if l.startswith(('FAIL', 'MARGINAL'))])
+    if fails:
+        overall = 'OVERALL: FAIL  (%d passed, %d failed)' % (passes, fails)
+    elif passes:
+        overall = 'OVERALL: PASS  (%d of %d tests)' % (passes, passes)
+    else:
+        overall = 'OVERALL: no result'
+    block = [bar, title, bar] + SUMMARY + [bar, overall, bar]
+    try:
+        with open(SUMMARY_FILE, 'w') as f:
+            f.write('\n'.join(block) + '\n')
+    except Exception:
+        pass
+    print('')
+    for line in block:
+        print(line)
+        sys.stdout.flush()
+        try:
+            post('RESPOND MSG="%s"' % line.replace('"', "'"), timeout=20)
+        except Exception:
+            pass
+
+
+CONFIG_FILE = '/home/voron24/printer_data/config/printer.cfg'
+
+
+def apply_config(rig, value):
+    """Write the tuned threshold into printer.cfg, inside the correct driver
+    section only.
+
+    Returns (changed, message). Backs up first - this edits the file that
+    decides how the machine moves, so it must be trivially reversible.
+
+    The edit is bounded to the driver's own section: printer.cfg contains a
+    driver_SGT for stepper_x AND stepper_y, so a naive whole-file replace would
+    silently overwrite the other axis.
+    """
+    key = 'driver_' + rig.field.upper()
+    try:
+        text = open(CONFIG_FILE).read()
+    except Exception as e:
+        return False, 'could not read printer.cfg: %s' % e
+
+    head = '[' + rig.tmc_sec + ']'
+    if head not in text:
+        return False, 'section %s not found' % head
+    start = text.index(head)
+    nxt = text.find('\n[', start + 1)
+    end = nxt if nxt != -1 else len(text)
+    block = text[start:end]
+
+    import re as _re
+    cur = _re.search(r'^%s:\s*(-?\d+)' % _re.escape(key), block, flags=_re.M)
+    if cur and int(cur.group(1)) == int(value):
+        return False, '%s already %d - no change, no restart needed' % (key, value)
+
+    backup = CONFIG_FILE + '.sgt.bak'
+    try:
+        open(backup, 'w').write(text)
+    except Exception as e:
+        return False, 'backup failed, not touching the config: %s' % e
+
+    if cur:
+        newblock = _re.sub(r'^%s:\s*-?\d+' % _re.escape(key),
+                           '%s: %d' % (key, value), block, count=1, flags=_re.M)
+    else:
+        lines = block.rstrip('\n').split('\n')
+        lines.append('%s: %d' % (key, value))
+        newblock = '\n'.join(lines) + '\n'
+    try:
+        open(CONFIG_FILE, 'w').write(text[:start] + newblock + text[end:])
+    except Exception as e:
+        return False, 'write failed: %s' % e
+    return True, '%s: %d written to printer.cfg' % (key, value)
+
+
+def say(msg=''):
+    """Print to the log AND push into the Mainsail console.
+
+    The script runs detached, so plain print() only reaches the log file. The
+    console meanwhile fills with the GET_POSITION dumps this script issues to
+    read step counts - all noise and no findings. RESPOND puts the actual
+    results where they are being read.
+    """
+    print(msg)
+    sys.stdout.flush()
+    try:
+        clean = msg.replace('"', "'")
+        if clean.strip():
+            post('RESPOND MSG="%s"' % clean, timeout=20)
+    except Exception:
+        pass    # console output is a convenience, never fail a test over it
+
+
+def query(objs):
+    # Encode, for the same reason post() does. Object names such as
+    # 'gcode_macro _SENSORLESS_VARS' contain a space, and http.client rejects a
+    # raw space in a URL outright - InvalidURL, before the request is even sent.
+    # safe='&=' keeps multi-object queries ('toolhead&configfile') working.
+    with urllib.request.urlopen(
+            BASE + '/printer/objects/query?' + urllib.parse.quote(objs, safe='&='),
+            timeout=15) as r:
+        return json.load(r)['result']['status']
+
+
+def mcu_steps():
+    """Raw MCU step counters: monotonic, NOT reset by homing.
+    The 'stepper:' line reads 0.000 until an axis is homed, so it is useless here."""
+    post('GET_POSITION')
+    time.sleep(1.0)
+    with urllib.request.urlopen(BASE + '/server/gcode_store?count=25', timeout=15) as r:
+        for m in reversed(json.load(r)['result']['gcode_store']):
+            hit = re.search(r'mcu:\s*(.*)', m['message'])
+            if hit:
+                d = dict(re.findall(r'(stepper_\w+):(-?\d+)', hit.group(1)))
+                if 'stepper_x' in d:
+                    return int(d['stepper_x']), int(d['stepper_y'])
+    raise RuntimeError('could not read GET_POSITION mcu line')
+
+
+
+# ---------------------------------------------------------------------------
+# StallGuard varies by driver generation. The two families use different field
+# names, different ranges, and OPPOSITE sensitivity directions - which is why a
+# working SGTHRS from a TMC2209 machine is meaningless on a TMC5160.
+#
+#   StallGuard2  tmc2130 / tmc2660 / tmc5160 (and tmc2160)
+#       field 'sgt', range -64..63, LOWER = MORE sensitive, needs spreadCycle
+#   StallGuard4  tmc2209 (sgthrs) / tmc2240 (sg4_thrs)
+#       range 0..255, HIGHER = MORE sensitive, SG4 needs stealthChop
+#
+# tmc2240 carries both: Klipper uses the SG4 path when sg4_thrs is non-zero,
+# otherwise it falls back to SG2 via sgt.
+# ---------------------------------------------------------------------------
+SG_SPEC = {
+    'tmc2130': ('sgt',      -64, 63,  -1),
+    'tmc2660': ('sgt',      -64, 63,  -1),
+    'tmc5160': ('sgt',      -64, 63,  -1),
+    'tmc2209': ('sgthrs',     0, 255,  1),
+    'tmc2240': ('sg4_thrs',   0, 255,  1),
+}
+
+
+def detect_driver(axis):
+    """Find which tmc driver section drives this axis. Returns
+    (section_name, driver_type, field, lo, hi, sign) where sign is +1 when a
+    HIGHER value is MORE sensitive."""
+    objs = query_list()
+    want = 'stepper_' + axis.lower()
+    for o in objs:
+        if ' ' in o and o.split()[0] in SG_SPEC and o.split()[1] == want:
+            drv = o.split()[0]
+            field, lo, hi, sign = SG_SPEC[drv]
+            if drv == 'tmc2240':
+                st = query('configfile')['configfile']['settings'][o]
+                if not st.get('driver_sg4_thrs'):
+                    field, lo, hi, sign = 'sgt', -64, 63, -1
+            return o, drv, field, lo, hi, sign
+    raise RuntimeError('no supported TMC driver found for ' + want)
+
+
+def query_list():
+    with urllib.request.urlopen(BASE + '/printer/objects/list', timeout=15) as r:
+        return json.load(r)['result']['objects']
+
+
+class Rig(object):
+    def __init__(self, axis):
+        self.axis = axis.upper()
+        s = query('configfile')['configfile']['settings']
+        st = s['stepper_' + self.axis.lower()]
+        (self.tmc_sec, self.drv, self.field,
+         self.sg_lo, self.sg_hi, self.sg_sign) = detect_driver(self.axis)
+        tmc = s[self.tmc_sec]
+        v = s['gcode_macro _sensorless_vars']
+        self.step_dist = st['rotation_distance'] / float(
+            st['full_steps_per_rotation'] * st['microsteps'])
+        self.rot_dist = st['rotation_distance']
+        self.unload = float(v['variable_unload_dist'])
+        self.backoff = float(v['variable_backoff'])
+        self.pos_max = st['position_max']
+        self.pos_min = st['position_min']
+        _sx = query('configfile')['configfile']['settings']['stepper_x']
+        self.mid_x = (_sx['position_min'] + _sx['position_max']) / 2.0
+        # Sweeps always start at the MOST sensitive end and walk toward the
+        # least, because over-sensitive fails safe (an early trip) while
+        # under-sensitive grinds the rail. Which numeric end that is depends on
+        # the driver: StallGuard2 (tmc2130/2660/5160) counts DOWN to more
+        # sensitive, StallGuard4 (tmc2209/2240) counts UP.
+        if self.sg_sign < 0:
+            self.sg_start, self.sg_end = self.sg_lo, self.sg_hi
+        else:
+            self.sg_start, self.sg_end = self.sg_hi, self.sg_lo
+        self.speed = st['homing_speed']
+        self.cool = tmc.get('coolstep_threshold')
+        # Live macro state, not configfile: SET_GCODE_VARIABLE changes the
+        # running value and never touches the file, so configfile would report
+        # a current the driver is not actually using.
+        live = query('gcode_macro _SENSORLESS_VARS')['gcode_macro _SENSORLESS_VARS']
+        base = float(live.get('home_current', v['variable_home_current']))
+        yhc = float(live.get('y_home_current', 0) or 0)
+        self.current = yhc if (self.axis == 'Y' and yhc > 0) else base
+        self.sgt_cfg = tmc.get('driver_' + self.field, tmc.get('driver_sgt', 0))
+        self.expected = self.pos_max / 2.0
+        # Are we sitting AT the rail? Only true right after a home that got
+        # there. goto_start() must never back off blindly - from mid-gantry a
+        # 150mm back-off drives straight into the opposite rail.
+        self.at_rail = False
+
+    def banner(self):
+        say('axis %s   driver %s   field %s   range %d..%d   %s = more sensitive'
+              % (self.axis, self.drv, self.field, self.sg_lo, self.sg_hi,
+                 'LOWER' if self.sg_sign < 0 else 'HIGHER'))
+        say('  homing_speed=%s  coolstep_threshold=%s  home_current=%s  config %s=%s'
+              % (self.speed, self.cool, self.current, self.field, self.sgt_cfg))
+        if self.cool and self.speed <= self.cool:
+            say('  !! homing_speed must be ABOVE coolstep_threshold or it can never trigger')
+        if self.speed <= self.rot_dist:
+            say('  !! klipper_tmc_autotune: homing_speed should EXCEED rotation_distance (%s)'
+                  % self.rot_dist)
+        say('')
+
+    def set_sgt(self, val):
+        post('SET_TMC_FIELD STEPPER=stepper_%s FIELD=%s VALUE=%d'
+             % (self.axis.lower(), self.field, val))
+        time.sleep(0.6)
+
+    def ensure_frame(self):
+        """Make BOTH axes count as homed so G1 is usable.
+
+        On CoreXY there is no X motor and no Y motor - both belts are driven by
+        both motors, so ANY single-axis move turns both. G1 drives them
+        simultaneously and stays on-axis. FORCE_MOVE can only drive one stepper
+        per command, so using it for a two-stepper move gives two 45 degree legs:
+        the head swings far off-axis and back. That is the diagonal you see.
+
+        The axis under test is homed for real. When X is under test, Y is merely
+        DECLARED at mid-travel - it is never measured, it just has to exist so G1
+        will run. When Y is under test the reverse is NOT safe: X is homed for
+        real, because a declared X corrupts the frame every Y move depends on.
+        """
+        other = 'y' if self.axis == 'X' else 'x'
+        if other not in query('toolhead')['toolhead']['homed_axes']:
+            if self.axis == 'Y':
+                # Declaring X here would tell the machine the head sits at
+                # mid-travel while it physically sits somewhere else. On CoreXY
+                # every following Y move is computed from that wrong frame, so
+                # the gantry drives into the rail. X is tuned by now: home it.
+                post('G28 X')
+                time.sleep(0.5)
+            else:
+                st = query('configfile')['configfile']['settings']['stepper_' + other]
+                post('SET_KINEMATIC_POSITION %s=%.0f'
+                     % (other.upper(), st['position_max'] / 2.0))
+                time.sleep(0.3)
+
+    def goto_start(self):
+        """Back off a FIXED distance from the rail before each trial.
+
+        This briefly retraced the exact distance the previous home travelled, to
+        start every trial from the identical spot. That is right when the
+        previous home was a full-length one - and wrong the moment it was not.
+        A sweep ends on a grind with the head AT the rail, so retracing returns
+        it to the rail, the next home trips after a few millimetres, and the run
+        after that starts from there too. The repeatability test then measures
+        ten 8mm twitches instead of ten 150mm approaches and calls the axis
+        broken.
+
+        The rail is the only stable reference on the axis, so the start line is
+        measured from it. correct_frame() has already reconciled Klipper's
+        position with the step counters - after a real home and after a false
+        trigger alike - so an absolute move is trustworthy and lands the same
+        place every time, which is exactly what the measurement needs.
+        """
+        if not self.at_rail:
+            return False
+        self.ensure_frame()
+        post('G90')
+        post('G1 %s%.1f F6000' % (self.axis, self.pos_max - self.expected))
+        post('M400')
+        time.sleep(0.5)
+        return True
+
+    def one_home(self):
+        """Home once. Returns (triggered, travel_mm).
+        Restores position with FORCE_MOVE so we never trust a coordinate frame
+        that a false trigger may have corrupted."""
+        if self.axis == 'Y':
+            # Fresh X reference before EVERY Y attempt, not just the first.
+            # A Y trial that grinds the rail can rack the gantry in X, and on
+            # CoreXY every Y move is resolved through the X frame - so a stale
+            # X quietly turns the next measurement into fiction. Re-homing X
+            # costs a few seconds and removes the whole failure mode.
+            try:
+                post('G28 X')
+                time.sleep(0.3)
+                # Homing parks X hard against its rail. Leaving it there puts the
+                # gantry in a corner for every Y trial, and X visibly slams to the
+                # rail between attempts. Put it back to mid-travel so both rails
+                # have room and the Y measurement is not taken from an extreme of
+                # the X travel.
+                post('G90')
+                post('G1 X%.1f F6000' % self.mid_x)
+                post('M400')
+                time.sleep(0.3)
+            except urllib.error.HTTPError:
+                pass
+        # Klipper reports 0 for an UNHOMED axis, which is not where the head is.
+        # Correcting the frame from that invents a position - it once told
+        # Klipper the head was at 2.2 while it sat against the rail at 300, so
+        # the next absolute move drove straight into that rail and every trial
+        # afterwards measured a 12mm twitch with a perfect 0.00mm spread.
+        # Without a valid starting point, the post-home position_max is the only
+        # thing we know, so leave it alone.
+        homed_before = self.axis.lower() in query('toolhead')['toolhead']['homed_axes']
+        p0 = axis_pos(self.axis) if homed_before else None
+        a0, b0 = mcu_steps()
+        try:
+            post('G28 ' + self.axis)
+            ok = True
+        except urllib.error.HTTPError:
+            ok = False
+        time.sleep(0.6)
+        a1, b1 = mcu_steps()
+        da, db = a1 - a0, b1 - b0
+        self.at_rail = ok
+        # CoreXY:  x = (a + b) / 2   ,   y = (a - b) / 2
+        raw = (da + db) / 2.0 if self.axis == 'X' else (da - db) / 2.0
+        # The macro's pre-home unload only fires when the axis is already homed
+        # AND within unload_dist of the rail - never true after a big back-off -
+        # so only the post-home backoff is added here.
+        travel = raw * self.step_dist + self.backoff
+        # Net physical displacement of THIS attempt. Kept so the head can be
+        # retraced to precisely where it started, rather than sent to a fixed
+        # coordinate that any frame error would shift.
+        self.last_moved = raw * self.step_dist
+        self.start_pos = p0
+        if p0 is not None:
+            correct_frame(self, p0, raw)
+        post('M400')
+        time.sleep(0.4)
+        return ok, travel
+
+    def less_sensitive(self):
+        """Direction that makes the threshold LESS sensitive.
+        SG2 (sgt): higher = less sensitive. SG4 (sgthrs): lower = less."""
+        return 'RAISE' if self.sg_sign < 0 else 'LOWER'
+
+    def more_sensitive(self):
+        return 'LOWER' if self.sg_sign < 0 else 'RAISE'
+
+    def classify(self, ok, travel):
+        if not ok or travel > self.expected * 1.25:
+            return 'FAIL'
+        if travel > self.expected * 0.90:
+            return 'GOOD'
+        if travel < 10:
+            return 'EARLY'
+        return 'SHORT'
+
+    def explain(self, verdict):
+        if verdict == 'GOOD':
+            return 'reached the rail - this value WORKS'
+        if verdict == 'FAIL':
+            return 'never triggered, ground the rail -> %s %s (more sensitive)' % (
+                self.more_sensitive(), self.field)
+        if verdict == 'EARLY':
+            return 'tripped instantly -> %s %s (less sensitive)' % (
+                self.less_sensitive(), self.field)
+        return 'stopped part way -> %s %s slightly' % (self.less_sensitive(), self.field)
+
+
+def sweep(rig, lo, hi, step, chain=True):
+    rig.banner()
+    say('  travel measured from MCU step counts. Wall-clock is useless: the homing')
+    say('  macro contains seconds of fixed dwell that swamp any timing.')
+    say('  Start the head mid-axis. A correct home travels about %.0fmm.' % rig.expected)
+    say()
+    good = []
+    rig.trail = []          # (value, verdict) for every trial, in order
+    val = lo
+    known = False
+    while (val <= hi if step > 0 else val >= hi):
+        rig.set_sgt(val)
+        rig.goto_start()
+        known = True
+        ok, travel = rig.one_home()
+        verdict = rig.classify(ok, travel)
+        rig.trail.append((val, verdict))
+        say('  %s=%4d  travel %7.1fmm  [%-5s] %s'
+              % (rig.field, val, travel, verdict, rig.explain(verdict)))
+        sys.stdout.flush()
+        if verdict == 'GOOD':
+            good.append(val)
+            say('        -> working values so far: %s' % good)
+            sys.stdout.flush()
+        note('%s=%-4d %7.1fmm  %s' % (rig.field, val, travel, verdict))
+        if verdict == 'FAIL':
+            say()
+            say('  STOPPING - past this point it only grinds the rail.')
+            break
+        val += step
+    say()
+    say('  ' + '-' * 68)
+    if good:
+        pick = good[len(good) // 2]
+        note('PASS  reached the rail at %s' % good)
+        note('best  %s = %d' % (rig.field, pick))
+        if len(good) == 1:
+            note('WARN  window is 1 value wide - fragile')
+            note('      one integer is not margin. It works cold and')
+            note('      fails warm, as X did across a single day.')
+            failure_advice(rig.axis, rig,
+                           'one integer is not margin - it works cold and'
+                           ' fails warm.')
+        if chain:
+            note('')
+            say()
+            say('  passed - chaining to repeatability (10 runs)')
+            verify(rig, pick, 10, chain=chain)
+            return good
+        note('NEXT  VERIFY_%s_HOME RUNS=5' % rig.axis)
+        say('  RESULT: %d value%s reached the rail: %s'
+              % (len(good), '' if len(good) == 1 else 's', good))
+        say()
+        say('  USE THIS ->  driver_%s: %d' % (rig.field.upper(), pick))
+        say('               in [%s] of printer.cfg' % rig.tmc_sec)
+        if len(good) == 1:
+            say()
+            say('  WARNING: the window is ONE value wide. That is fragile - StallGuard')
+            say('  drifts with motor temperature, so it can stop working as the machine')
+            say('  soaks. Make sure START_PRINT homes BEFORE the heat soak.')
+        say()
+        say('  NEXT STEP - prove it repeats. One success can be a FALSE trigger,')
+        say('  which reports success while stopping nowhere near the rail:')
+        say('      VERIFY_%s_HOME RUNS=5' % rig.axis)
+        say('  then if the spread is under 1mm:')
+        say('      TEST_%s_HOME_RANGE     homes from 5..250mm off the rail' % rig.axis)
+        say('      MEASURE_%s_RAIL        checks position_max is honest' % rig.axis)
+    else:
+        note('FAIL  no %s value reached the rail' % rig.field)
+        note('the threshold is NOT the problem - every value was')
+        note('tried and none worked, so stop tuning it')
+        failure_advice(rig.axis, rig, 'no threshold worked at these settings.')
+        if rig.speed <= rig.rot_dist:
+            note('DO    homing_speed %g -> %g' % (rig.speed, rig.rot_dist * 1.5))
+            note('      must exceed rotation_distance %g' % rig.rot_dist)
+        else:
+            note('DO    homing_speed %g, coolstep %g'
+                 % (rig.speed * 1.3, rig.speed * 1.3 * 0.83))
+        if X_PROVEN and rig.axis == 'Y':
+            note('NOT   belts/pulleys/grubs - X homed on the SAME two')
+            note('      motors and belts, so those are proven good')
+            note('ALSO  home_current %sA +/-0.1; Y-only suspects are' % rig.current)
+            note('      gantry racking, Y rails, gantry mass')
+        else:
+            note('ALSO  home_current %sA +/-0.1, belts, grubs' % rig.current)
+        say('  RESULT: NOTHING WORKED - no %s value reached the rail.' % rig.field)
+        say()
+        say('  Do NOT keep sweeping the threshold. If every value fails the same way,')
+        say('  the threshold is not the problem. Change ONE of these, then re-run:')
+        say()
+        say('   1. homing_speed   (now %s, rotation_distance is %s)'
+              % (rig.speed, rig.rot_dist))
+        if rig.speed <= rig.rot_dist:
+            say('      *** THIS IS ALMOST CERTAINLY IT *** homing_speed MUST exceed')
+            say('      rotation_distance for sensorless. Try %g.' % (rig.rot_dist * 1.5))
+        else:
+            say('      already above rotation_distance. Try %g for a stronger signal.'
+                  % (rig.speed * 1.3))
+        say()
+        say('   2. coolstep_threshold   (now %s)' % rig.cool)
+        say('      Keep it just BELOW homing_speed, about 0.8x, so StallGuard engages')
+        say('      at steady speed rather than mid acceleration ramp. Try %g.'
+              % (rig.speed * 0.83))
+        say('      IF TRAVEL WAS IDENTICAL AT EVERY THRESHOLD, THIS IS THE CAUSE.')
+        say()
+        say('   3. home_current   (now %sA)' % rig.current)
+        say('      Too LOW and the motors skip instead of stalling: the axis crawls,')
+        say('      drifts diagonally on CoreXY, and StallGuard never sees a stall.')
+        say('      Too HIGH and the frame takes a harder hit. Move by 0.1A.')
+        say()
+        if X_PROVEN and rig.axis == 'Y':
+            say('   4. NOT the belts, pulleys or grub screws.')
+            say('      X homed on this same pair of motors and this same pair of')
+            say('      belts - on CoreXY an X move turns both of them - so the')
+            say('      shared drivetrain is proven good. Do not go looking there.')
+            say('      What Y does NOT share with X: the Y linear rails, and the')
+            say('      whole gantry mass that only Y has to drag. If anything is')
+            say('      mechanical it is gantry racking or a binding Y rail.')
+        else:
+            say('   4. mechanical. Loose belts or a loose pulley grub screw give exactly')
+            say('      this signature - a slack belt absorbs the impact so the stall is')
+            say('      soft and gradual, with nothing sharp to detect.')
+    say('  ' + '-' * 68)
+    return good
+
+
+def verify(rig, sgt, runs, chain=True):
+    rig.banner()
+    rig.set_sgt(sgt)
+    say('  verifying %s=%d over %d runs' % (rig.field, sgt, runs))
+    say('  homing once first to reach the rail, then backing off %.0fmm before each run'
+          % rig.expected)
+    say()
+    rig.one_home()
+    res = []
+    for i in range(1, runs + 1):
+        rig.goto_start()
+        ok, travel = rig.one_home()
+        v = rig.classify(ok, travel)
+        res.append(travel)
+        run_spread = max(res) - min(res)
+        say('  run %d/%d: travel %7.1fmm  [%-5s]  spread so far %.2fmm'
+              % (i, runs, travel, v, run_spread))
+        sys.stdout.flush()
+    spread = max(res) - min(res)
+    mean = sum(res) / len(res)
+    say()
+    say('  ' + '-' * 68)
+    say('  spread %.2fmm over %d runs   (mean travel %.1fmm, expected %.0fmm)'
+          % (spread, runs, mean, rig.expected))
+    fails = [r for r in res if abs(r - rig.expected) > rig.expected * 0.1]
+    rig.last_spread = spread
+    rig.last_mean = mean
+    note('-- repeatability --')
+    note('%s=%d  %d runs  %.1fmm  spread %.2fmm'
+         % (rig.field, sgt, runs, mean, spread))
+    if fails:
+        note('FAIL  %d/%d runs missed the rail' % (len(fails), runs))
+        note('marginal - works only sometimes')
+        note('DO    re-run FIND_%s_SGT, pick mid-window' % rig.axis)
+    elif spread < 1.0:
+        note('PASS  origin repeats exactly')
+        changed, msg = apply_config(rig, sgt)
+        note('CFG   ' + msg)
+        if changed:
+            note('DO    run FIRMWARE_RESTART to load it')
+        if chain:
+            note('')
+            say()
+            say('  passed - chaining to the home range test')
+            distances(rig, [5, 15, 40, 120, 250], chain=chain, runs=runs)
+            return
+        note('NEXT  TEST_%s_HOME_RANGE' % rig.axis)
+    elif spread < 3.0:
+        note('MARGINAL  origin wanders %.2fmm' % spread)
+        note('prints shift by that much')
+        note('DO    check belt tension')
+    else:
+        note('FAIL  origin moves between homes')
+        if X_PROVEN and rig.axis == 'Y':
+            note('NOT   belts/grubs - shared with X, which passes')
+            note('DO    check gantry racking + Y rails')
+        else:
+            note('DO    check belts + pulley grub screws')
+    if fails:
+        say('  FAIL - %d of %d runs did not reach the rail.' % (len(fails), runs))
+        say('  This threshold is MARGINAL: it works sometimes. Do not use it.')
+        say('  Re-run FIND_%s_SGT and pick a value nearer the MIDDLE of the window.'
+              % rig.axis)
+    elif spread < 1.0:
+        say('  PASS - the origin lands in the same place every time. Use this value.')
+        say()
+        say('  MAKE IT PERMANENT ->  driver_%s: %d' % (rig.field.upper(), sgt))
+        say('                        in [%s]' % rig.tmc_sec)
+        say('  THEN:  TEST_%s_HOME_RANGE   then   MEASURE_%s_RAIL'
+              % (rig.axis, rig.axis))
+    elif spread < 3.0:
+        say('  MARGINAL - usable, but the origin wanders by that much between homes')
+        say('  and prints will shift by the same amount. Try a threshold one step')
+        say('  further from the edge of the window, or check belt tension first.')
+    else:
+        say('  FAIL - the origin moves between homes. Not usable for printing.')
+        if X_PROVEN and rig.axis == 'Y':
+            say('  Not the belts or grub screws - X homes on the same motors and')
+            say('  belts and repeats exactly. Look at gantry racking and the Y rails.')
+        else:
+            say('  Check belts and pulley grub screws BEFORE touching the threshold:')
+            say('  a slack belt softens the stall and makes the trigger point wander.')
+    short = rig.expected - mean
+    if abs(short) > 3 and not fails:
+        say()
+        say('  NOTE: averaging %+.1fmm off the expected travel.' % (-short))
+        say('  A consistent short stop means Klipper believes it is at position_endstop')
+        say('  while the head is somewhere else - the WHOLE coordinate frame is offset')
+        say('  by that much and every print shifts with it.')
+        say('  Fix: %s %s by 1 so it reaches the rail, or set position_endstop to match.'
+              % (rig.less_sensitive(), rig.field))
+    say('  ' + '-' * 68)
+
+
+def distances(rig, dists, chain=True, runs=10):
+    """Home from a spread of starting distances. A home that only works from
+    mid-travel is not much use: close to the rail StallGuard may still be loaded
+    from the previous touch, and from the far end the axis builds momentum."""
+    rig.banner()
+    rig.set_sgt(rig.sgt_cfg)
+    say('  homing from %s mm off the rail' % dists)
+    say()
+    rig.one_home()
+    bad = []
+    for d in dists:
+        rig.ensure_frame()
+        post('G90')
+        post('G1 %s%.1f F6000' % (rig.axis, rig.pos_max - d))
+        post('M400')
+        time.sleep(0.5)
+        rig.at_rail = True
+        p0 = axis_pos(rig.axis)
+        a0, b0 = mcu_steps()
+        try:
+            post('G28 ' + rig.axis)
+            ok = True
+        except urllib.error.HTTPError:
+            ok = False
+        time.sleep(0.6)
+        a1, b1 = mcu_steps()
+        da, db = a1 - a0, b1 - b0
+        rig.at_rail = ok
+        raw = (da + db) / 2.0 if rig.axis == 'X' else (da - db) / 2.0
+        travel = raw * rig.step_dist + rig.backoff
+        correct_frame(rig, p0, raw)
+        err = travel - d
+        verdict = 'OK' if (ok and abs(err) < 3.0) else (
+            'NO TRIGGER' if not ok else 'OFF by %+.1fmm' % err)
+        if verdict != 'OK':
+            bad.append(d)
+        say('  start %6.1fmm off rail -> travel %7.1fmm (expected %6.1f)   %s'
+            % (d, travel, d, verdict))
+    say()
+    note('-- home range --')
+    note('from %s mm off the rail' % dists)
+    if bad:
+        note('FAIL  at %s' % bad)
+        note('DO    raise unload_dist in _SENSORLESS_VARS')
+        say('  FAILED from these distances: %s' % bad)
+        say('  Close to the rail usually means StallGuard is still loaded from the')
+        say('  previous touch. Raise _SENSORLESS_VARS unload_dist so it backs off')
+        say('  further before homing.')
+    else:
+        note('PASS  homes from every distance')
+        if chain:
+            note('')
+            say()
+            say('  passed - chaining to the rail measurement')
+            # Carry the user's RUNS through instead of a hardcoded 10, so one
+            # parameter governs the whole chain rather than only its first test.
+            measure_axis(rig, runs)
+            return
+        say('  PASS - homes correctly from every distance tested.')
+
+
+def measure_axis(rig, runs=10):
+    """Measure the TRUE usable length of the axis, rail to rail.
+
+    Home at the max end, drive to position_min, home again, and read the real
+    distance from MCU step counts. If measured < configured, the head is hitting
+    the far rail BEFORE position_min - the config claims travel the machine does
+    not have, and every print is squeezed into a frame that does not exist."""
+    rig.banner()
+    rig.set_sgt(rig.sgt_cfg)
+    pmin = query('configfile')['configfile']['settings'][
+        'stepper_' + rig.axis.lower()]['position_min']
+    claimed = rig.pos_max - pmin
+    say('  config claims %.1fmm of travel (position_min %.1f, position_max %.1f)'
+        % (claimed, pmin, rig.pos_max))
+    say('  measuring the real rail-to-rail distance over %d runs' % runs)
+    say()
+    rig.one_home()
+    res = []
+    for i in range(1, runs + 1):
+        rig.ensure_frame()
+        post('G90')
+        post('G1 %s%.1f F6000' % (rig.axis, pmin))
+        post('M400')
+        time.sleep(0.6)
+        rig.at_rail = True
+        p0 = axis_pos(rig.axis)
+        a0, b0 = mcu_steps()
+        try:
+            post('G28 ' + rig.axis)
+            ok = True
+        except urllib.error.HTTPError:
+            ok = False
+        time.sleep(0.6)
+        a1, b1 = mcu_steps()
+        da, db = a1 - a0, b1 - b0
+        rig.at_rail = ok
+        raw = (da + db) / 2.0 if rig.axis == 'X' else (da - db) / 2.0
+        travel = raw * rig.step_dist + rig.backoff
+        correct_frame(rig, p0, raw)
+        res.append(travel)
+        say('  run %d/%d: rail-to-rail %7.2fmm   %s'
+            % (i, runs, travel, 'measured' if ok else 'NO TRIGGER'))
+    say()
+    mean = sum(res) / len(res)
+    say('  measured %.2fmm  (spread %.2fmm)   config claims %.2fmm'
+        % (mean, max(res) - min(res), claimed))
+    diff = mean - claimed
+    note('-- rail measure --')
+    note('measured %.2fmm  spread %.2fmm' % (mean, max(res) - min(res)))
+    note('config   %.2fmm claimed' % claimed)
+    if abs(diff) < 1.0:
+        note('MATCH  position_max is correct')
+        say('  MATCH - position_max is correct.')
+    elif diff < 0:
+        note('SHORT by %.1fmm' % -diff)
+        note('DO    cut position_max by ~%.0fmm' % -diff)
+        say('  SHORT by %.1fmm. The head reaches the far rail BEFORE position_min,' % -diff)
+        say('  so the config claims travel the machine does not have.')
+        say('  FIX: reduce position_max by about %.0fmm, or raise position_min.' % -diff)
+    else:
+        say('  LONGER by %.1fmm than configured - there is unused travel available.' % diff)
+        say('  You could raise position_max by up to %.0fmm.' % diff)
+
+
+def axis_pos(axis):
+    """Where Klipper currently believes the axis is."""
+    return query('toolhead')['toolhead']['position'][0 if axis == 'X' else 1]
+
+
+def correct_frame(rig, p0, raw):
+    """Re-align Klipper's frame with reality, but ONLY after a FALSE trigger.
+
+    Klipper sets the axis to position_max on any successful home. When the home
+    genuinely reached the rail that value is exact and authoritative - the rail
+    is a hard physical reference, better than anything derived from step counts,
+    which carry the error of p0 with them. Overwriting a good home with an
+    estimate is how the position ends up wrong AFTER a home that worked.
+
+    When the trigger was false the head is nowhere near position_max, and every
+    later absolute move is computed from that fiction - which is what drove the
+    head into the opposite rail. There the step counters are the only truth
+    available, so use them.
+
+    So: decide which happened by comparing the distance actually covered against
+    the distance to the rail from where we started.
+    """
+    moved = raw * rig.step_dist              # net displacement, backoff included
+    reached = moved + rig.backoff            # distance covered before it tripped
+    to_rail = rig.pos_max - p0               # distance it SHOULD have covered
+    tol = max(3.0, abs(to_rail) * 0.05)
+    if to_rail > 0 and abs(reached - to_rail) <= tol:
+        # Genuine home. Klipper is right; leave it alone.
+        return None
+    true_now = max(rig.pos_min, min(rig.pos_max, p0 + moved))
+    believed = axis_pos(rig.axis)
+    if abs(believed - true_now) <= 1.0:
+        return true_now
+    post('SET_KINEMATIC_POSITION %s=%.3f' % (rig.axis, true_now))
+    time.sleep(0.25)
+    say('    false trigger: klipper said %s=%.1f, really %.1f (out by %.1fmm)'
+        % (rig.axis, believed, true_now, believed - true_now))
+    return true_now
+
+
+def set_home_current(amps, axis='X'):
+    """Change the homing current the sensorless macro uses.
+
+    Y writes to its OWN variable: the axes share one home_current by default,
+    but X's threshold is calibrated at that value, so a Y experiment written
+    into the shared variable would silently re-tune X.
+    """
+    var = 'y_home_current' if axis == 'Y' else 'home_current'
+    post('SET_GCODE_VARIABLE MACRO=_SENSORLESS_VARS VARIABLE=%s VALUE=%.3f'
+         % (var, amps))
+    time.sleep(0.3)
+    say('  homing current for %s set to %.2fA  (%s)' % (axis, amps, var))
+
+
+def edit_cfg(head, key, value):
+    """Set key inside [head] of printer.cfg.
+
+    Section-scoped deliberately: X and Y carry identical key names, so an
+    unscoped replace rewrites the other axis - the tuned one - in silence.
+    """
+    import re as _re
+    text = open(CONFIG_FILE).read()
+    marker = '[' + head + ']'
+    if marker not in text:
+        return False
+    start = text.index(marker)
+    nxt = text.find('\n[', start + 1)
+    end = nxt if nxt != -1 else len(text)
+    chunk = text[start:end]
+    pat = '^' + _re.escape(key) + r':\s*\S+'
+    if not _re.search(pat, chunk, flags=_re.M):
+        return False
+    chunk = _re.sub(pat, '%s: %s' % (key, value), chunk, count=1, flags=_re.M)
+    open(CONFIG_FILE, 'w').write(text[:start] + chunk + text[end:])
+    return True
+
+
+def park_centre(rig):
+    """Return the axis to mid-travel between combinations.
+
+    Two cases, and the second is the one that used to break:
+
+    - The axis is homed. Klipper knows where it is, so an absolute move works.
+    - The axis is NOT homed, because every threshold failed and the last attempt
+      ground into the rail. G28 errored, so Klipper cleared the homed state and
+      rejects any move with "Must home axis first". The old code just threw here,
+      and the next combination then declared the axis at CENTRE while the head
+      was physically against the rail - so its first home started from the wrong
+      end and drove straight back into the stop.
+
+    A grind is not a lost position though: pushing against the rail is exactly
+    where position_max is. So declare that, then move off it normally. An early
+    trigger cannot reach this path, because there G28 succeeded and the axis is
+    homed.
+    """
+    mid = (rig.pos_min + rig.pos_max) / 2.0
+    try:
+        homed = rig.axis.lower() in query('toolhead')['toolhead']['homed_axes']
+    except Exception:
+        homed = False
+    try:
+        if not homed:
+            say('  %s ended against the rail unhomed - declaring %.0f, then centring'
+                % (rig.axis, rig.pos_max))
+            post('SET_KINEMATIC_POSITION %s=%.1f' % (rig.axis, rig.pos_max))
+            time.sleep(0.3)
+        post('G90')
+        post('G1 %s%.1f F6000' % (rig.axis, mid))
+        post('M400')
+        time.sleep(0.5)
+        return True
+    except urllib.error.HTTPError:
+        say('  could not park %s at centre - hand-centre it before the next run'
+            % rig.axis)
+        return False
+
+
+def coarse_to_fine(rig, lo, hi):
+    """Sweep the WHOLE threshold range at single-integer resolution.
+
+    This used to walk coarsely first and refine afterwards, to save homing at
+    128 values. That optimisation was wrong: a working window can be ONE integer
+    wide, and a step-4 pass steps straight over it. On this machine it tested 0
+    (stopped short) and 4 (ground the rail), never touched 1..3, and reported
+    "no threshold works" at settings that had been proven working by hand
+    minutes earlier. Every conclusion drawn from those runs was unsound.
+
+    Step 1 cannot skip a window. It is slower, but the sweep still stops at the
+    first grind, so the cost is bounded by where the window actually is rather
+    than by the width of the range.
+    """
+    step = 1 if hi >= lo else -1
+    return sweep(rig, lo, hi, step, chain=False) or []
+
+
+def matrix(axis, accels, currents, lo, hi):
+    """Sweep threshold x accel x current, using RUNTIME changes only.
+
+    This deliberately does NOT touch homing_speed. homing_speed is a config
+    option with no runtime command, so sweeping it meant rewriting printer.cfg
+    and forcing a firmware restart - and on a USB-to-CAN bridge each restart
+    resets the host MCU, drops its USB device and destroys can0, briefly taking
+    the CAN toolhead board with it. A StallGuard tuning tool has no business
+    managing firmware restarts, USB re-enumeration or MCU liveness, and every
+    abort so far came from that machinery rather than from the tuning.
+
+    So speed is a fixed input here: whatever printer.cfg currently says. To try
+    a different one, change homing_speed deliberately and run this again. The
+    report states the speed it ran at so results are never ambiguous.
+    """
+    results = []
+    speed = Rig(axis).speed
+    total = len(accels) * len(currents)
+    n = 0
+    say('  homing_speed is %g (from printer.cfg) and is NOT swept here.' % speed)
+    say('  To test another speed, change it, restart, and re-run.')
+    say('  %d combinations: accels %s, currents %s' % (total, accels, currents))
+    say('  threshold range %d..%d, full span, coarse then fine' % (lo, hi))
+    say()
+    for ac in accels:
+        for cu in currents:
+            n += 1
+            post('SET_GCODE_VARIABLE MACRO=_SENSORLESS_VARS '
+                 'VARIABLE=%s_home_accel VALUE=%d' % (axis.lower(), ac))
+            time.sleep(0.3)
+            rig = Rig(axis)
+            say()
+            say('  === %d/%d  accel %d  current %.2fA  (speed %g) ==='
+                % (n, total, ac, cu, speed))
+            if axis == 'Y':
+                okx, why = require_x_calibrated()
+                if not okx:
+                    say('  ' + why)
+                    return results
+            mark = len(SUMMARY)
+            try:
+                good = coarse_to_fine(rig, lo, hi)
+            except Exception as exc:
+                say('  combination failed: %s' % exc)
+                good = []
+            del SUMMARY[mark:]
+            results.append({'speed': speed, 'accel': ac, 'current': cu,
+                            'good': good, 'width': len(good)})
+            say('  -> window %s (%d wide)'
+                % (good if good else 'none', len(good)))
+            park_centre(rig)
+
+    # Window width alone is not enough: a combination can reach the rail at
+    # several thresholds and still stop somewhere different each time, which is
+    # what prints as a layer shift. The finalists are re-tested for
+    # REPEATABILITY, and that decides the winner.
+    finalists = sorted([r for r in results if r['width'] > 0],
+                       key=lambda r: -r['width'])[:4]
+    if finalists:
+        say()
+        say('  === repeatability check on the %d best ===' % len(finalists))
+        for r in finalists:
+            post('SET_GCODE_VARIABLE MACRO=_SENSORLESS_VARS '
+                 'VARIABLE=%s_home_accel VALUE=%d' % (axis.lower(), r['accel']))
+            rig = Rig(axis)
+            if axis == 'Y':
+                okx, _why = require_x_calibrated()
+                if not okx:
+                    break
+            pick = r['good'][len(r['good']) // 2]
+            mark = len(SUMMARY)
+            try:
+                verify(rig, pick, 5, chain=False)
+                r['spread'] = getattr(rig, 'last_spread', None)
+            except Exception as exc:
+                say('  repeatability failed: %s' % exc)
+                r['spread'] = None
+            del SUMMARY[mark:]
+            r['sgt'] = pick
+            say('  ac%d %.2fA sgt%d -> spread %s'
+                % (r['accel'], r['current'], pick,
+                   ('%.2fmm' % r['spread']) if r['spread'] is not None else 'n/a'))
+            park_centre(rig)
+    return results
+
+
+def failure_advice(axis, rig, why):
+    """Say exactly what to change when no threshold works.
+
+    None of these are swept automatically any more. homing_speed is config-only,
+    and accel and current are deliberately left alone so a sweep cannot leave the
+    machine in a state it did not start in - an aborted run used to strand the
+    drivers at the homing current, and every later home re-confirmed it.
+
+    So the tool measures and advises; the changes are yours to make. One at a
+    time, re-testing between, because each of these invalidates the threshold
+    tuned against the others.
+    """
+    a = axis.lower()
+    try:
+        v = query('gcode_macro _SENSORLESS_VARS')['gcode_macro _SENSORLESS_VARS']
+        accel = float(v.get('%s_home_accel' % a, 0) or 0)
+    except Exception:
+        accel = 0
+    note('')
+    note(why)
+    note('change ONE of these, then re-run:')
+    note('')
+
+    note('1. homing_speed - now %g' % rig.speed)
+    cands = []
+    for mult in (1.3, 1.6, 0.75):
+        c = round(rig.speed * mult / 5.0) * 5
+        if c > rig.rot_dist and c != rig.speed and c not in cands:
+            cands.append(c)
+    for c in cands:
+        note('     %-4g with coolstep_threshold %g' % (c, round(c * 0.83)))
+    note('   StallGuard reads load from back-EMF, so too slow leaves it')
+    note('   nothing to read and no threshold can rescue that. Must stay')
+    note('   above rotation_distance %g.' % rig.rot_dist)
+    note('   [stepper_%s] homing_speed' % a)
+    note('   [tmc5160 stepper_%s] coolstep_threshold' % a)
+    note('   keep them paired - coolstep just under the speed, or')
+    note('   StallGuard ends up reading the acceleration ramp.')
+    note('   needs FIRMWARE_RESTART.')
+    note('')
+
+    note('2. homing accel - now %d' % accel if accel else '2. homing accel - not set')
+    if accel:
+        note('     try %d or %d' % (int(accel * 0.5), int(accel * 1.5)))
+    else:
+        note('     try 1000, or 500')
+    note('   Acceleration load can sit close to the stall load on a heavy')
+    note('   axis, leaving no gap for a threshold to live in. Too low and')
+    note('   momentum carries the axis past the trigger point.')
+    note('   _SENSORLESS_VARS  variable_%s_home_accel' % a)
+    note('')
+
+    note('3. home_current - now %.2fA' % rig.current)
+    note('     try %.1fA or %.1fA, in 0.1A steps'
+         % (max(0.4, rig.current - 0.2), rig.current + 0.2))
+    note('   Too low and the motor skips instead of stalling - a skid is')
+    note('   soft and gradual, and StallGuard cannot pick it out from')
+    note('   acceleration. Too high and the stall is blunt, and the frame')
+    note('   takes the hit. 0 = home at the configured run current.')
+    note('   _SENSORLESS_VARS  variable_home_current')
+    note('')
+
+    note('4. mechanical - check LAST, and only if the other axis fails')
+    note('   too. On CoreXY both motors and both belts turn for either')
+    note('   axis, so an axis that passes proves the shared drivetrain:')
+    note('   belts, pulleys and grub screws are all exonerated by it.')
+    note('   What is NOT shared: that axis own linear rails, and on Y the')
+    note('   whole gantry mass it alone has to drag.')
+
+
+def report_matrix(axis, results):
+    ok = [r for r in results if r['width'] > 0]
+    note('-- parameter matrix --')
+    note('%d combinations at homing_speed %g'
+         % (len(results), results[0]['speed'] if results else 0))
+    if not ok:
+        note('FAIL  no combination produced a window')
+        failure_advice(axis, Rig(axis), 'nothing reached the rail at any threshold.')
+        return
+    # Measured repeatability beats window width: a wide window that wanders is
+    # useless, a narrow one that repeats is printable. Unmeasured combinations
+    # sort last rather than being treated as perfect.
+    def rank(r):
+        sp = r.get('spread')
+        return (0 if sp is not None else 1,
+                round(sp, 2) if sp is not None else 999,
+                -r['width'])
+
+    ok.sort(key=rank)
+    note('ranked by spread, then window width:')
+    for r in ok[:6]:
+        sp = r.get('spread')
+        note('sp%-4g ac%-5d %.2fA win%-2d %s'
+             % (r['speed'], r['accel'], r['current'], r['width'],
+                ('spread %.2fmm' % sp) if sp is not None else 'not measured'))
+    b = ok[0]
+    pick = b.get('sgt') or b['good'][len(b['good']) // 2]
+    sp = b.get('spread')
+    note('')
+    note('BEST  speed %g  accel %d  current %.2fA'
+         % (b['speed'], b['accel'], b['current']))
+    note('      sgt %d, window %d wide' % (pick, b['width']))
+    if sp is None:
+        note('WARN  repeatability was never measured for this one')
+    elif sp < 0.5:
+        note('PASS  spread %.2fmm - printable' % sp)
+    elif sp < 1.5:
+        note('MARGINAL  spread %.2fmm - prints shift by that much' % sp)
+    else:
+        note('FAIL  spread %.2fmm - not usable, keep looking' % sp)
+    if b['width'] == 1:
+        note('WARN  window is 1 value wide - fragile when warm')
+    # A result that reaches the rail but wanders, or one balanced on a single
+    # integer, is not finished - and speed is the dial this cannot turn itself.
+    if b['width'] == 1 or (sp is not None and sp >= 0.5):
+        failure_advice(axis, Rig(axis),
+                       'this works but has no margin to spare.')
+
+
+def require_x_calibrated():
+    """Y may not be tested until X homes for real. Returns (ok, reason).
+
+    Y drags the whole gantry and its every move is resolved through the X
+    coordinate frame. If X has never been homed, that frame is a guess, and a
+    Y test then measures the guess rather than the axis - which is how a sweep
+    reports a 300mm 'travel' that is really a crash into the rail.
+
+    The check is the honest one: actually home X. Nothing else proves X is
+    tuned, and if X cannot home then no Y number would have meant anything.
+    """
+    say('  Y needs a real X frame first - homing X')
+    try:
+        post('G28 X')
+    except urllib.error.HTTPError:
+        return False, 'X will not home - tune X first (FIND_X_SGT, VERIFY_X_HOME)'
+    time.sleep(0.7)
+    if 'x' not in query('toolhead')['toolhead']['homed_axes']:
+        return False, 'X did not home - tune X first (FIND_X_SGT, VERIFY_X_HOME)'
+    global X_PROVEN
+    X_PROVEN = True
+    say('  X homed - frame is real')
+
+    # Centre X, but NEVER move Y.
+    #
+    # Y's physical position is genuinely unknown before the first home: nothing
+    # has measured it. An earlier version declared Y at the rail and drove it
+    # forward to centre, which is only correct if that guess is right - if the
+    # head was already forward, that move drives it into the FRONT rail. There
+    # is no safe way to move an axis whose position you do not know.
+    #
+    # So the head is placed at Y centre BY HAND before the sweep, and the only
+    # thing done here is to tell Klipper where it already is. X is different:
+    # it was just homed for real, so moving it is safe and exact.
+    cfg = query('configfile')['configfile']['settings']
+    stx, sty = cfg['stepper_x'], cfg['stepper_y']
+    midx = (stx['position_min'] + stx['position_max']) / 2.0
+    midy = (sty['position_min'] + sty['position_max']) / 2.0
+    post('G90')
+    post('G1 X%.1f F6000' % midx)
+    post('M400')
+    time.sleep(0.5)
+    say('  X centred at %.0f. Y is NOT moved - its position is unknown.' % midx)
+    say('  ASSUMING the head was placed at Y centre by hand, as instructed.')
+    say('  declaring Y=%.0f without moving. If the head is not near centre,'
+        % midy)
+    say('  STOP NOW: the first home would travel from the wrong place.')
+    post('SET_KINEMATIC_POSITION Y=%.0f' % midy)
+    time.sleep(0.3)
+    say()
+    say()
+    return True, ''
+
+
+def main():
+    args = sys.argv[1:]
+    # By default a passing test flows into the next one:
+    #   sweep -> repeatability -> home range -> rail measure
+    # A failure stops the chain there, since later tests would be meaningless.
+    chain = True
+    if '--nochain' in args:
+        chain = False
+        args.remove('--nochain')
+    if '--current' in args:
+        i = args.index('--current')
+        # The axis token can sit after the flag, so find it rather than assuming
+        # args[0] - otherwise a Y run would write X's shared current.
+        say('  --current is no longer supported: homing uses the current in'
+            ' _SENSORLESS_VARS, so a run cannot strand the drivers elsewhere')
+        del args[i:i + 2]
+    # Every Y path is gated on X, before any Y motion is commanded.
+    if args and args[0].upper() == 'Y':
+        ok, why = require_x_calibrated()
+        if not ok:
+            note('REFUSED  ' + why)
+            note('Y moves resolve through the X frame. Without a homed X')
+            note('a Y sweep measures a guess, and grinds into the rail.')
+            post('M84')
+            flush_summary('SUMMARY - Y REFUSED (X NOT CALIBRATED)')
+            return
+    if '--measure' in args:
+        i = args.index('--measure')
+        axis = args[0] if i > 0 else 'X'
+        runs = int(args[i + 1]) if len(args) > i + 1 else 10
+        measure_axis(Rig(axis), runs)
+        title = 'SUMMARY - %s RAIL MEASURE' % axis.upper()
+    elif '--matrix' in args:
+        i = args.index('--matrix')
+        axis = next((a.upper() for a in args if a.upper() in ('X', 'Y')), 'Y')
+
+        def _lst(flag, default):
+            if flag not in args:
+                return default
+            j = args.index(flag)
+            out = []
+            for tok in args[j + 1:]:
+                try:
+                    out.append(float(tok))
+                except ValueError:
+                    break
+            return out or default
+
+        # 1000 is in the default list because it is the only accel that has
+        # actually produced a working Y window. 500 collapsed it entirely.
+        accels = [int(a) for a in _lst('--accels', [1000.0, 1500.0])]
+        currents = _lst('--currents', [0.8, 1.0, 1.2])
+        rig0 = Rig(axis)
+        # Default: the driver's entire range, most sensitive end first.
+        lo, hi = int(rig0.sg_start), int(rig0.sg_end)
+        req = _lst('--sgt', [])
+        if len(req) >= 2:
+            # A user range is honoured but CLAMPED to what the driver actually
+            # accepts. Writing a value outside the register's range does not
+            # fail loudly - it wraps or saturates - so the sweep would report
+            # results for a threshold the driver never held.
+            d_lo, d_hi = min(rig0.sg_lo, rig0.sg_hi), max(rig0.sg_lo, rig0.sg_hi)
+            want_lo, want_hi = int(req[0]), int(req[1])
+            lo = max(d_lo, min(d_hi, want_lo))
+            hi = max(d_lo, min(d_hi, want_hi))
+            if (lo, hi) != (want_lo, want_hi):
+                say('  requested %d..%d is outside what %s accepts (%d..%d)'
+                    % (want_lo, want_hi, rig0.drv, d_lo, d_hi))
+                say('  clamped to %d..%d' % (lo, hi))
+            else:
+                say('  sweeping %d..%d as requested (%s allows %d..%d)'
+                    % (lo, hi, rig0.drv, d_lo, d_hi))
+        else:
+            say('  sweeping the full %s range %d..%d, most sensitive first'
+                % (rig0.drv, lo, hi))
+        combos = len(accels) * len(currents)
+        per = abs(hi - lo) + 1
+        say('  ESTIMATE: %d combinations x ~%d homes = ~%d homes, roughly %d min'
+            % (combos, per, combos * per, combos * per * 8 // 60))
+        say('  Narrow it with SPEEDS= ACCELS= CURRENTS= if that is too long.')
+        say('  STOP_SGT_DIAG aborts at any point.')
+        say()
+        res = matrix(axis, accels, currents, lo, hi)
+        report_matrix(axis, res)
+        title = 'SUMMARY - %s PARAMETER MATRIX' % axis
+    elif '--range' in args:
+        i = args.index('--range')
+        axis = args[0] if i > 0 else 'X'
+        ds = [float(x) for x in args[i + 1:]] or [5, 20, 50, 150, 250]
+        runs_opt = 10
+        distances(Rig(axis), ds, chain=chain, runs=runs_opt)
+        title = 'SUMMARY - %s HOME RANGE' % axis.upper()
+    elif '--verify' in args:
+        i = args.index('--verify')
+        axis = args[0] if i > 0 else 'X'
+        rig = Rig(axis)
+        raw = args[i + 1] if len(args) > i + 1 else 'cfg'
+        # 'cfg' means: use whatever the config already has. Lets a macro call
+        # this without knowing the driver family or field name.
+        sgt = rig.sgt_cfg if raw == 'cfg' else int(raw)
+        runs = int(args[i + 2]) if len(args) > i + 2 else 10
+        verify(rig, int(sgt), runs, chain=chain)
+        title = 'SUMMARY - %s REPEATABILITY' % axis.upper()
+    else:
+        axis = args[0] if args else 'X'
+        rig = Rig(axis)
+        # Default to the driver's FULL range, most sensitive end first. The old
+        # defaults were hardcoded StallGuard2 numbers, so on a StallGuard4
+        # driver they named thresholds that scale does not even contain.
+        d_lo, d_hi = min(rig.sg_lo, rig.sg_hi), max(rig.sg_lo, rig.sg_hi)
+        if len(args) > 2:
+            want_lo, want_hi = int(args[1]), int(args[2])
+            lo = max(d_lo, min(d_hi, want_lo))
+            hi = max(d_lo, min(d_hi, want_hi))
+            if (lo, hi) != (want_lo, want_hi):
+                say('  requested %d..%d is outside what %s accepts (%d..%d)'
+                    % (want_lo, want_hi, rig.drv, d_lo, d_hi))
+                say('  clamped to %d..%d' % (lo, hi))
+            step = int(args[3]) if len(args) > 3 else (1 if hi >= lo else -1)
+        else:
+            lo, hi = int(rig.sg_start), int(rig.sg_end)
+            step = 1 if hi >= lo else -1
+            say('  no range given - sweeping the full %s range %d..%d'
+                % (rig.drv, lo, hi))
+        sweep(rig, lo, hi, step, chain=chain)
+        title = 'SUMMARY - %s FULL TUNE' % rig.axis
+    post('M84')
+    flush_summary(title)
+
+
+if __name__ == '__main__':
+    main()
