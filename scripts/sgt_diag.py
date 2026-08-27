@@ -728,7 +728,19 @@ def distances(rig, dists, chain=True, runs=10):
         rig.at_rail = ok
         raw = (da + db) / 2.0 if rig.axis == 'X' else (da - db) / 2.0
         travel = raw * rig.step_dist + rig.backoff
-        correct_frame(rig, p0, raw)
+        ##  Anchor from the rail contact instead of inferring the position.
+        ##  correct_frame guesses from p0 - the position BEFORE the home - and a
+        ##  wrong p0 makes the correction wrong, which shifts the next absolute
+        ##  move, which corrupts the next measurement. That compounded at ~2.8mm
+        ##  per run here and read as a distance-dependent error, which is
+        ##  exactly what a real mechanical fault looks like. After a successful
+        ##  home the position is known, so say so.
+        if ok:
+            post('SET_KINEMATIC_POSITION %s=%.3f'
+                 % (rig.axis, rig.pos_max - rig.backoff))
+            time.sleep(0.3)
+        else:
+            correct_frame(rig, p0, raw)
         err = travel - d
         verdict = 'OK' if (ok and abs(err) < 3.0) else (
             'NO TRIGGER' if not ok else 'OFF by %+.1fmm' % err)
