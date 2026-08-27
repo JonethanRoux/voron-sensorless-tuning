@@ -370,8 +370,8 @@ class Rig(object):
 
     def one_home(self):
         """Home once. Returns (triggered, travel_mm).
-        Restores position with FORCE_MOVE so we never trust a coordinate frame
-        that a false trigger may have corrupted."""
+        Reconciles the coordinate frame afterwards so a false trigger cannot
+        leave Klipper believing the axis is somewhere it is not."""
         if self.axis == 'Y':
             # Fresh X reference before EVERY Y attempt, not just the first.
             # A Y trial that grinds the rail can rack the gantry in X, and on

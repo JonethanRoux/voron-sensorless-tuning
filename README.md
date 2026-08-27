@@ -51,14 +51,64 @@ Hence a shell command. Note that `RUN_SHELL_COMMAND` **blocks** the calling
 macro, while the script needs the gcode queue to drive the machine - so
 `sgt_run.sh` launches it detached. Calling the Python directly deadlocks.
 
-## Install
+## Requirements
 
-Requires [gcode_shell_command](https://github.com/dw-0/kiauh) (KIAUH installs
-it) and Moonraker on `localhost:7125`.
+Check these first. Three of them are hard requirements that fail in ways that
+are not obvious from the error message.
+
+**1. `gcode_shell_command`** - not part of stock Klipper. Install via
+[KIAUH](https://github.com/dw-0/kiauh) ("Advanced" -> "G-Code Shell Command"),
+or copy `gcode_shell_command.py` into `~/klipper/klippy/extras/`. Without it
+Klipper refuses the config with `Unknown config object 'gcode_shell_command'`.
+
+**2. `[force_move]` with `enable_force_move: True`** - required, and this is
+the one that catches people out. In current Klipper, `SET_KINEMATIC_POSITION`
+is registered *inside* that guard:
+
+```python
+self._enable_force_move = config.getboolean("enable_force_move", False)
+if self._enable_force_move:
+    gcode.register_command('SET_KINEMATIC_POSITION', ...)
+```
+
+The tools use it to reconcile the coordinate frame after a false trigger. Add
+to `printer.cfg`:
+
+```
+[force_move]
+enable_force_move: True
+```
+
+**3. `[respond]`** - every result is reported with `RESPOND`. Add the bare
+section to `printer.cfg` if you do not already have it.
+
+**4. Moonraker on `localhost:7125`** - the script drives the machine over the
+HTTP API. If yours listens elsewhere, edit `BASE` at the top of `sgt_diag.py`.
+
+**5. Sensorless homing already wired up.** These tools tune a threshold; they
+do not set up sensorless homing for you. You need the diag pin connected and
+the axis pointed at the virtual endstop:
+
+```
+[stepper_x]
+endstop_pin: tmc5160_stepper_x:virtual_endstop
+homing_retract_dist: 0        # a retract-and-retry cannot work on StallGuard
+
+[tmc5160 stepper_x]
+diag1_pin: ^!PC15             # diag0_pin / diag_pin on other drivers
+```
+
+`homing_retract_dist: 0` matters: the second touch of a retract-and-retry
+starts with StallGuard still loaded from the first, so it triggers immediately.
+
+**6. Python 3 on the host.** Standard library only, no pip packages.
+
+## Install
 
 ```bash
 cp scripts/sgt_diag.py scripts/sgt_run.sh ~/
 chmod +x ~/sgt_run.sh
+mkdir -p ~/printer_data/config/homing
 cp config/sensorless*.cfg ~/printer_data/config/homing/
 ```
 
@@ -68,8 +118,16 @@ Add to `printer.cfg`:
 [include homing/*.cfg]
 ```
 
-Paths in `sgt_run.sh` and the `[gcode_shell_command]` blocks assume the user is
-`voron24` - edit if yours differs. Then `FIRMWARE_RESTART`.
+**Paths assume the user is `voron24`.** If yours differs, edit the absolute
+paths in `sgt_run.sh`, in `sgt_diag.py` (`CONFIG_FILE`), and in the four
+`[gcode_shell_command]` blocks at the top of `sensorless_tools.cfg`. Then
+`FIRMWARE_RESTART`, and run `SENSORLESS_STATUS` to confirm it can see your
+driver and that the rules below hold.
+
+`sensorless.cfg` also provides the `[homing_override]` that does the actual
+homing. If you already have your own, take `sensorless_tools.cfg` alone and
+keep yours - but the tools assume homing drops to `home_current` and backs off
+afterwards, so read `_SENSORLESS_HOME` before dropping it.
 
 ## Use
 
