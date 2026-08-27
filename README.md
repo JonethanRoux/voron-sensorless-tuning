@@ -177,6 +177,130 @@ homing. If you already have your own, take `sensorless_tools.cfg` alone and
 keep yours - but the tools assume homing drops to `home_current` and backs off
 afterwards, so read `_SENSORLESS_HOME` before dropping it.
 
+## Walkthrough - tuning an axis from scratch
+
+**Do X first.** It moves only the toolhead, so a grind is gentler, and on
+CoreXY a passing X proves the motors, belts, pulleys and grub screws are all
+sound - which rules them out if Y then misbehaves.
+
+### 1. Check the rules
+
+```
+SENSORLESS_STATUS
+```
+
+It prints both axes and checks the things that must hold - `homing_speed`
+above `rotation_distance`, `coolstep_threshold` below `homing_speed`. If it
+flags either, fix that first. No threshold can compensate.
+
+### 2. Put the gantry in the middle
+
+Sweeps home *into* a rail, so the head needs room to build speed and a real
+distance to travel. Starting against the rail it is homing into gives an
+instant trip that means nothing.
+
+```
+M84
+```
+
+Then **push the toolhead to roughly mid-travel by hand**, both axes. For Y
+this is mandatory and the macro will remind you: Y is never moved
+automatically, because until the first successful home its position is
+unmeasured, and moving an axis you cannot locate is how a gantry ends up in a
+rail. X is homed for real first, so it looks after itself.
+
+### 3. Sweep
+
+```
+FIND_X_SGT
+```
+
+Five warnings and a ten second countdown, then it moves. **Stay by the
+emergency stop** - but read step 4 before you use it.
+
+### 4. Expect one grind. Do NOT stop it.
+
+A sweep walks from the most sensitive value to the least, and the run looks
+like this:
+
+```
+sgt=-64  3.5mm  [EARLY]   tripped instantly, harmless
+sgt=-63  3.5mm  [EARLY]
+...                        many of these, all identical
+sgt=0    150.1mm [GOOD ]  reached the rail - this value WORKS
+sgt=1    150.6mm [GOOD ]
+sgt=2    170.2mm [GOOD ]
+sgt=3    458.5mm [FAIL ]  <-- GRINDS. This is expected.
+STOPPING - past this point it only grinds the rail.
+```
+
+**That last line is the point of the test.** The sweep has to find the value
+that is too insensitive to trigger, because the working window is bounded by
+it. When it happens the motor drives into the stop and **it sounds bad** - a
+loud grinding or buzzing for a second or two as the belts skip.
+
+**Let it finish.** The script detects the failure, stops the sweep itself, and
+never tries a worse value. Hitting the emergency stop there aborts the run and
+you lose everything measured up to that point - the sweep has to start over.
+
+Reach for the e-stop if something *else* is wrong: the head moving away from
+the rail it should home into, a crash into the opposite end, a collision with
+a clip or cable, or grinding that continues for more than a few seconds.
+
+The early trips at the sensitive end are the safe failure mode - the axis
+barely moves. Over-sensitive fails harmlessly; under-sensitive grinds. That is
+why sweeps always start at the sensitive end.
+
+### 5. Read the verdict
+
+On a pass it chains automatically into repeatability, home-range and
+rail-measure, and ends with one line:
+
+```
+OVERALL: PASS (3 of 3 tests)
+```
+
+The numbers that matter:
+
+- **Window width.** `[0,1,2]` is three values wide - good margin. `[1]` alone
+  works today and fails when the machine is warm.
+- **Spread.** Under 0.5mm is printable. Over 1mm shows as layer shifts.
+- **Rail measure.** Should match `position_max - position_min`.
+
+### 6. If the window is narrow, adjust in this order
+
+Change **one** thing, then re-sweep - each of these invalidates a threshold
+tuned against the others. The report names actual values to try.
+
+1. **`homing_speed`** (and `coolstep_threshold` with it, at about 0.83x).
+   This is the biggest lever. StallGuard reads load from back-EMF, so faster
+   gives a stronger signal to discriminate against. On the test machine Y went
+   from a 1-wide window at 78mm/s to 2-wide at 100mm/s, and its rail
+   measurement tightened from 2.70mm of scatter to 0.40mm. Config-only, so it
+   needs a `FIRMWARE_RESTART`.
+2. **Homing accel** - `variable_x_home_accel` / `variable_y_home_accel`.
+   Acceleration load can sit close to stall load on a heavy axis, leaving no
+   gap for a threshold to live in. Runtime, no restart.
+3. **`home_current`** via `SET_HOME_CURRENT`, in 0.1A steps. Too low and the
+   motor skips instead of stalling, and a skid is soft and gradual where a
+   stall is sharp. Too high and the stall is blunt. Note that more is not
+   better: on the test machine Y found a window at 1.0A and none at all at
+   either 0.8A or 1.2A.
+4. **Mechanical** - last, and only if the *other* axis also fails. See the
+   CoreXY note below.
+
+`TUNE_X_MATRIX` automates 2 and 3 together across the whole threshold range,
+and ranks the combinations by window width and then by measured repeatability.
+
+### 7. Apply and repeat for Y
+
+A passing sweep writes the threshold into `printer.cfg` and tells you a
+restart is needed. Then centre the gantry by hand again and run `FIND_Y_SGT`.
+
+Expect Y to be harder. It drags the entire gantry while X moves only the
+toolhead, so it loads the motor far more and generally wants its own speed and
+current.
+
 ## Use
 
 ```
