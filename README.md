@@ -423,10 +423,32 @@ hold 1.0A, `rotation_distance` 40 with 400 full steps per rotation.
   (`x = (a+b)/2`, `y = (a-b)/2`). On a cartesian or delta machine the measured
   distances will be wrong, and wrong measurements here mean the head is driven
   somewhere unexpected. Do not run it.
-- **A hot machine.** All tuning was done cold, with an unheated chamber. That
-  is deliberate: StallGuard drifts with motor temperature, so the design homes
-  X and Y cold and re-homes only Z after the heat soak. Values found cold may
-  not hold at 60C chamber, and the tools do not compensate for temperature.
+- **A hot machine, or an enclosed one.** This is the biggest gap, so read it
+  properly.
+
+  Every value here was found on a machine **with the side panels off and the
+  chamber unheated** - effectively room temperature throughout. Nothing has
+  been tuned or verified with the enclosure closed and the chamber at 50-60C.
+
+  That matters because StallGuard drifts with motor temperature, and this
+  repo's own data shows it: X measured a 0.00mm spread cold, then drifted to
+  0.60mm across a single warm day, and recovered once the machine cooled. The
+  design works around this by homing X and Y **cold** in `START_PRINT` and
+  re-homing only Z after the heat soak, since Z uses a probe that does not
+  care about temperature. But "works around" is not "verified".
+
+  Y in particular is unproven: its 0.60mm spread was measured cold, and its
+  working window is 2 values wide against X's 3 - so it has less margin to
+  absorb any drift. Whether that holds hot is genuinely unknown.
+
+  If you run this, **re-run `VERIFY_X_HOME RUNS=10` and `VERIFY_Y_HOME
+  RUNS=10` after a long print**, with the machine at working temperature.
+  That is the condition that actually decides whether a threshold is usable,
+  and it costs a few minutes. A window one value wide will very likely fail
+  that test.
+
+  I will do this myself once the panels are on, and update the repo with what
+  I find - good or bad.
 - **Any board other than the Kraken**, any motor other than the one above, and
   any voltage other than 48V on XY. Current and speed both scale back-EMF, so a
   different motor or supply voltage changes what every threshold means.
