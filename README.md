@@ -152,11 +152,56 @@ share with X is its own linear rails and the gantry mass it alone drags.
 The tools apply this: once one axis has passed, a failure on the other says so
 explicitly rather than sending you to check belts.
 
-## Status
+## What has actually been tested
 
-Working on a Voron 2.4 with TMC5160s. Tested on that machine only - the
-StallGuard4 paths are implemented from the datasheet field definitions but have
-not been run on real 2209/2240 hardware. Reports welcome.
+Read this before running it. It has been used on **exactly one machine**, and
+several things it supports are implemented from datasheets rather than proven
+on hardware.
+
+**Tested on:**
+
+| | |
+|---|---|
+| Printer | Voron 2.4 r2, 300mm |
+| Kinematics | **CoreXY only** |
+| Board | BTT Kraken, TMC5160 on X and Y |
+| Motors | LDO-42STH48-2004MAH, 0.9 degree, 2.0A peak, 48V on XY |
+| Klipper | v0.13.0-743 |
+| Host | Debian 13 (trixie), Python 3.13.5 |
+| Moonraker | default, `localhost:7125` |
+
+Settled on this machine: X `sgt=1` at homing_speed 78 / coolstep 65, Y `sgt=1`
+at homing_speed 100 / coolstep 83, homing current 1.0A against run 1.2A /
+hold 1.0A, `rotation_distance` 40 with 400 full steps per rotation.
+
+**NOT tested:**
+
+- **StallGuard4 hardware.** The tmc2209 (`sgthrs`) and tmc2240 (`sg4_thrs`)
+  paths are written from the datasheet field definitions and the opposite
+  sensitivity direction is handled, but no 2209 or 2240 has ever run this. Try
+  it with your hand on the emergency stop and expect to find bugs.
+- **Anything but CoreXY.** The travel maths is CoreXY-specific
+  (`x = (a+b)/2`, `y = (a-b)/2`). On a cartesian or delta machine the measured
+  distances will be wrong, and wrong measurements here mean the head is driven
+  somewhere unexpected. Do not run it.
+- **A hot machine.** All tuning was done cold, with an unheated chamber. That
+  is deliberate: StallGuard drifts with motor temperature, so the design homes
+  X and Y cold and re-homes only Z after the heat soak. Values found cold may
+  not hold at 60C chamber, and the tools do not compensate for temperature.
+- **Any board other than the Kraken**, any motor other than the one above, and
+  any voltage other than 48V on XY. Current and speed both scale back-EMF, so a
+  different motor or supply voltage changes what every threshold means.
+- **Long-term use.** This was written and used over a few days. It has not run
+  across firmware upgrades or seen a large sample of prints.
+
+**It deliberately crashes your printer.** Every sweep drives the toolhead into
+the rail on purpose, and a threshold that is too insensitive does not stop - it
+grinds until the axis runs out of travel. On this machine a failed value
+produced roughly 150mm of a motor fighting the stop. Belts can skip, printed
+parts can crack, and a badly wrong config could do worse. Stay on the
+emergency stop for the whole run.
+
+No warranty. See the licence. If it breaks your machine, that is on you.
 
 ## License
 
