@@ -12,6 +12,15 @@ config claims.
 
 Driver-agnostic: it detects which StallGuard generation is fitted and adapts.
 
+> **Tune X first, always.** Not a preference - it changes what a Y result
+> means. X moves only the toolhead, so a failed value grinds far more gently
+> than one that drives the whole gantry. More importantly, on CoreXY both
+> motors and both belts turn for *either* axis, so an X axis that passes
+> proves the entire shared drivetrain is sound. Without that baseline, a Y
+> failure could be the threshold, the belts, the pulleys, a grub screw or the
+> gantry, and you have no way to tell them apart. With it, only the Y rails
+> and the gantry mass are left. Doing Y first throws that away.
+
 ## Why a threshold that "works" often isn't tuned
 
 A single successful home proves very little. A false trigger also reports
@@ -432,6 +441,30 @@ parts can crack, and a badly wrong config could do worse. Stay on the
 emergency stop for the whole run.
 
 No warranty. See the licence. If it breaks your machine, that is on you.
+
+## Contributing
+
+Improvements welcome - issues and pull requests both. This was written to
+solve one machine's problem and then generalised, so there is plenty that
+could be better.
+
+Particularly useful:
+
+- **StallGuard4 hardware reports.** The tmc2209 and tmc2240 paths are written
+  from datasheets and have never been run. If you try it, say what happened
+  either way - a "worked fine on a 2209" is as useful as a bug report.
+- **Non-CoreXY kinematics.** The travel maths is CoreXY-specific and the tool
+  should refuse to run elsewhere rather than measure nonsense. Someone who
+  knows cartesian or delta step relationships could fix that properly.
+- **Results from other machines** - motor, voltage, board, and the values you
+  settled on. The more of those there are, the better the starting suggestions
+  can get.
+- **Temperature behaviour.** All tuning here was done cold, deliberately. If
+  you have data on how much a threshold drifts as a chamber heats, that is the
+  gap I most want filled.
+
+No strong conventions - readable code and a note on what you tested is plenty.
+If you find something wrong, saying so is a contribution too.
 
 ## License
 
