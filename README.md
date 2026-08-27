@@ -51,6 +51,55 @@ Hence a shell command. Note that `RUN_SHELL_COMMAND` **blocks** the calling
 macro, while the script needs the gcode queue to drive the machine - so
 `sgt_run.sh` launches it detached. Calling the Python directly deadlocks.
 
+## Before you run this
+
+**This is a tuning tool, not a setup tool.** It assumes your machine already
+moves correctly and that sensorless homing is wired and working badly - not
+that it is unbuilt or miswired. Every test drives the toolhead into a rail on
+purpose, so anything wrong underneath gets driven into a rail too.
+
+Confirm all of the following yourself first. None of it takes long, and each
+one is a thing that will otherwise waste hours or break something:
+
+**Directions are correct.** Verify, do not assume. Declare a position, command
+a small move, and watch which way the head physically goes:
+
+```
+SET_KINEMATIC_POSITION X=150 Y=150
+G90
+G1 X160 F600      ; must move TOWARD the rail X homes into
+G1 Y160 F600      ; must move TOWARD the rail Y homes into
+```
+
+If a positive move goes away from the rail that `homing_positive_dir` points
+at, stop and fix the direction first. A sweep on an inverted axis measures
+nothing useful and drives the gantry into the opposite end.
+
+**The mechanics are sound.** Belts tensioned, pulley grub screws tight, both
+axes moving freely by hand with no binding or notchy spots. StallGuard infers
+load; a rough axis reads as load and trips early, and no threshold fixes that.
+
+**The steps are right.** A commanded 100mm move should measure 100mm with a
+ruler. If `rotation_distance` or `full_steps_per_rotation` is wrong, every
+travel figure this tool reports is wrong by the same factor.
+
+**Endstops and limits are honest.** `position_min` and `position_max` should
+roughly match the real travel. `MEASURE_X_RAIL` will tell you if they do not,
+but it needs a working home first.
+
+**Sensorless homing already triggers at all**, even if badly - a plain `G28 X`
+should stop at the rail rather than grinding indefinitely. If it never
+triggers at any threshold, the problem is wiring, `homing_speed`, or
+`coolstep_threshold`, not the threshold. Run `SENSORLESS_STATUS`, which checks
+the rules that must hold.
+
+**You have run the basics.** Motors move the right amount, the frame is
+square, the gantry is levelled. Tuning a threshold on a machine with a
+mechanical fault produces a number that encodes the fault.
+
+If you are not sure about any of the above, sort that out first. This will
+happily spend an hour measuring a broken machine very precisely.
+
 ## Requirements
 
 Check these first. Three of them are hard requirements that fail in ways that
