@@ -1,0 +1,6 @@
+# These files are deployed to a Linux host. CRLF would break the shell script
+# with "bad interpreter: /bin/bash^M" and is wrong for Klipper config too.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.cfg  text eol=lf
+*.md   text eol=lf
