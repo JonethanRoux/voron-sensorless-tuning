@@ -382,6 +382,8 @@ class Rig(object):
         trigger alike - so an absolute move is trustworthy and lands the same
         place every time, which is exactly what the measurement needs.
         """
+        if self.at_rail and not self.frame_ok:
+            say('    (not repositioning - frame untrusted, homing from here)')
         if not self.at_rail or not self.frame_ok:
             ##  at_rail is True after ANY home that returned, a false trigger
             ##  included, so on its own it is no evidence this coordinate means
@@ -428,6 +430,11 @@ class Rig(object):
         # thing we know, so leave it alone.
         homed_before = self.axis.lower() in query('toolhead')['toolhead']['homed_axes']
         p0 = axis_pos(self.axis) if homed_before else None
+        ##  Trust PROPAGATES. If we knew where the head was before this home,
+        ##  then p0 + measured displacement is still known afterwards - even
+        ##  after a false trigger. The earlier bug was not that p0 was used, it
+        ##  was that p0 was used WITHOUT knowing whether it meant anything.
+        trusted_before = bool(self.frame_ok and p0 is not None)
         a0, b0 = mcu_steps()
         try:
             post('G28 ' + self.axis)
@@ -464,24 +471,40 @@ class Rig(object):
         ##  and its endpoint is exactly position_max - a hard physical fact.
         ##  Anything shorter means the absolute position is UNKNOWABLE, and the
         ##  honest response is to refuse absolute moves rather than guess one.
-        ##  A GRIND is proof of rail contact too - 458mm of travel on a 300mm
-        ##  axis means it ran the full length and kept pushing. Refusing to
-        ##  anchor there left the head parked against the rail with no way to
-        ##  back off, so a chained verify measured ten 12mm twitches instead of
-        ##  ten 150mm approaches and called a good threshold marginal.
+        ##  Two cases, and conflating them is what produced ten 10mm twitches
+        ##  where 150mm approaches were reported.
         ##
-        ##  The two cases park in different places: a home that TRIGGERED ran
-        ##  the macro's backoff afterwards, a home that errored did not.
-        if travel >= self.expected * 0.90:
+        ##  A short travel does NOT mean "did not reach the rail". Starting AT
+        ##  the rail and homing gives a short travel precisely because you are
+        ##  already there. Requiring a long travel to trust the frame threw away
+        ##  a perfectly good anchor every time the previous trial ground.
+        if trusted_before:
+            ##  p0 was real, so everything here is real. Compare what the home
+            ##  covered against how far the rail actually was.
+            to_rail = self.pos_max - p0
+            tol = max(3.0, abs(to_rail) * 0.05)
+            if to_rail > 0 and abs(travel - to_rail) <= tol:
+                at = self.pos_max - self.backoff      # genuine contact
+            else:
+                at = max(self.pos_min,
+                         min(self.pos_max, p0 + self.last_moved))
+                say('    false trigger: %.1fmm short of the rail, frame'
+                    ' corrected to %.1f' % (to_rail - travel, at))
+            post('SET_KINEMATIC_POSITION %s=%.3f' % (self.axis, at))
+            time.sleep(0.25)
+            self.frame_ok = True
+        elif travel >= self.expected * 0.90:
+            ##  No usable p0, so only a long travel proves rail contact. A home
+            ##  that TRIGGERED ran the macro's backoff; one that ground did not.
             post('SET_KINEMATIC_POSITION %s=%.3f'
                  % (self.axis, self.pos_max - (self.backoff if ok else 0.0)))
             time.sleep(0.25)
             self.frame_ok = True
+            say('    frame re-anchored from the rail')
         else:
-            if self.frame_ok:
-                say('    false trigger - frame is now UNTRUSTED, no absolute'
-                    ' moves until a home actually reaches the rail')
             self.frame_ok = False
+            say('    position UNKNOWABLE - no trusted reference and no rail'
+                ' contact. Absolute moves suspended.')
         post('M400')
         time.sleep(0.4)
         return ok, travel
@@ -585,7 +608,35 @@ def sweep(rig, lo, hi, step, chain=True):
             say('  Check second_home_dist and unload_dist before re-running.')
             break
         if verdict == 'FAIL':
+            ##  A grind proves the head is hard against the rail, so a RELATIVE
+            ##  move away from it is safe with no coordinate frame at all. This
+            ##  leaves the axis parked mid-travel instead of jammed, which is
+            ##  what the chained repeatability test needs - and saves having to
+            ##  re-centre by hand between the sweep and the verify.
             say()
+            say('  backing off the rail (relative move, no frame needed)')
+            post('G91')
+            post('G1 %s-%.1f F3000' % (rig.axis, rig.expected))
+            post('G90')
+            post('M400')
+            time.sleep(0.5)
+            ##  A grind does not only cost the axis being swept. On CoreXY the
+            ##  carriage is blocked while both motors keep stepping, so A and B
+            ##  skip by DIFFERENT amounts - and since y = (a - b) / 2, that
+            ##  difference is a real Y movement. The belts also redistribute
+            ##  tension against a blocked carriage and drag the gantry. The
+            ##  other axis is therefore no longer where Klipper thinks either.
+            other = 'Y' if rig.axis == 'X' else 'X'
+            say()
+            say('  NOTE: that grind may have racked the gantry in %s.' % other)
+            say('  On CoreXY a blocked carriage makes both motors skip, and')
+            say('  unequal skid between them moves the OTHER axis. %s is no' % other)
+            say('  longer where Klipper believes - re-home it before trusting')
+            say('  any %s coordinate.' % other)
+            try:
+                post('SET_KINEMATIC_POSITION')   # no axis given: nothing moves
+            except Exception:
+                pass
             say('  STOPPING - past this point it only grinds the rail.')
             break
         val += step
@@ -614,7 +665,10 @@ def sweep(rig, lo, hi, step, chain=True):
             say('  every value below reaches the rail; this decides which one')
             say('  lands in the SAME PLACE, which is what actually prints.')
             scored = []
-            for v in good:
+            for n_v, v in enumerate(good, 1):
+                say()
+                say('  [%d/%d] %s=%d - 5 homes ...'
+                    % (n_v, len(good), rig.field, v))
                 mark = len(SUMMARY)
                 try:
                     verify(rig, v, 5, chain=False)
@@ -624,9 +678,35 @@ def sweep(rig, lo, hi, step, chain=True):
                     sp = None
                 del SUMMARY[mark:]
                 scored.append((v, sp))
-                say('  -> %s=%-4d spread %s'
-                    % (rig.field, v,
-                       ('%.2fmm' % sp) if sp is not None else 'n/a'))
+                ##  Everything worth reading goes HERE, after the runs. Put it
+                ##  before and it scrolls past behind the per-run lines and the
+                ##  number you actually came for arrives on its own.
+                where = ('MOST SENSITIVE of the working values - nearest the'
+                         ' false-trigger edge' if v == min(good) else
+                         'LEAST SENSITIVE of the working values - nearest the'
+                         ' grinding edge' if v == max(good) else
+                         'mid-window - margin on both sides')
+                say()
+                say('  ' + '=' * 60)
+                if sp is None:
+                    say('  RESULT  %s=%d : NO RESULT - treated as unusable'
+                        % (rig.field, v))
+                else:
+                    say('  RESULT  %s=%d : spread %.2fmm  (%s)'
+                        % (rig.field, v, sp,
+                           'excellent' if sp < 0.35 else
+                           'usable' if sp < 1.0 else
+                           'TOO LOOSE - this prints as a layer shift'))
+                say('  WHERE   %s' % where)
+                say('  MEANS   all five homes must land on the SAME number.')
+                say('          The number itself only has to be about %.0fmm.'
+                    % rig.expected)
+                done = [x for x in scored if x[1] is not None]
+                if len(done) > 1:
+                    b = min(done, key=lambda x: x[1])
+                    say('  BEST    so far %s=%d at %.2fmm  (%d of %d tested)'
+                        % (rig.field, b[0], b[1], len(scored), len(good)))
+                say('  ' + '=' * 60)
             usable = [(v, sp) for v, sp in scored if sp is not None]
             if usable:
                 ##  Rank by measured spread. Ties break toward the LESS sensitive
