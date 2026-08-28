@@ -637,44 +637,32 @@ def sweep(rig, lo, hi, step, chain=True):
             ##  which is what physically squares a CoreXY gantry. Do it at the
             ##  KNOWN-GOOD config threshold, never the value that just ground.
             other = 'Y' if rig.axis == 'X' else 'X'
-            say()
-            say('  that grind racked the gantry in %s - squaring it before' % other)
-            say('  anything else is measured.')
             rig.set_sgt(rig.sgt_cfg)
-            recovered = True
-            try:
-                post('G28 %s' % other)      # gantry into its rails: de-racks
-                time.sleep(0.6)
-                post('G28 %s' % rig.axis)   # then re-establish this axis
-                time.sleep(0.6)
-            except Exception as exc:
-                recovered = False
-                say('  RECOVERY FAILED: %s' % exc)
-            if recovered:
-                rig.frame_ok = True
-                say('  re-homed, frame re-anchored from a real home')
-                if chain:
-                    ##  Re-homing SHOULD have squared it. The tool cannot verify
-                    ##  that, and measuring a skewed gantry produces confident
-                    ##  nonsense, so this is the operator's call.
-                    ok_go = ask_operator(
-                        'Check the gantry before measuring',
-                        ['sgt=%d ground the rail, which can rack the gantry.' % val,
-                         'It has been re-homed, but that is not proof it is square.',
-                         'Check both gantry ends sit evenly and move freely,',
-                         'then centre the head.',
-                         'Continue runs %d repeatability tests. Cancel keeps the'
-                         ' window result and stops.' % len(good)])
-                    if not ok_go:
-                        chain = False
-                    else:
-                        rig.frame_ok = False   # motors were off; re-anchor by homing
-            else:
-                ##  Better to report nothing than to report the skew.
-                chain = False
-                say('  NOT measuring on a racked gantry. The window above is')
-                say('  still valid - only the repeatability comparison is')
-                say('  skipped. Re-home by hand and re-run to get it.')
+            say()
+            say('  that grind can rack the gantry in %s.' % other)
+            ##  The tool does NOT re-home to fix this, and that is deliberate.
+            ##  G28 on the other axis is still a MOVE - on an axis whose
+            ##  position is now unknown and whose own homing is unproven,
+            ##  immediately after a crash. That is the exact state in which
+            ##  this tool has already driven a gantry into a rail twice.
+            ##
+            ##  Squaring a racked gantry is a thirty-second job by hand and an
+            ##  unbounded risk by script. Release the motors and ask.
+            rig.frame_ok = False
+            if chain:
+                ok_go = ask_operator(
+                    'Square the gantry before measuring',
+                    ['sgt=%d ground the rail. On CoreXY that can rack the' % val,
+                     'gantry: the carriage is blocked while both motors keep',
+                     'stepping, and unequal skid between them moves %s.' % other,
+                     'Anything measured on a skewed gantry describes the skew,',
+                     'not the threshold.',
+                     'Motors are OFF. Square the gantry by hand, then centre',
+                     'the head on %s.' % rig.axis,
+                     'Continue runs %d repeatability tests.' % len(good),
+                     'Cancel keeps the window result above and stops.'])
+                if not ok_go:
+                    chain = False
             say('  STOPPING - past this point it only grinds the rail.')
             break
         val += step
