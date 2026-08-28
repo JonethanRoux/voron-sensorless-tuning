@@ -721,15 +721,19 @@ def sweep(rig, lo, hi, step, chain=True):
                 % len(good))
             say('  every value below reaches the rail; this decides which one')
             say('  lands in the SAME PLACE, which is what actually prints.')
-            ##  The value that closed the window is tested too. One grind is
-            ##  not proof it ALWAYS grinds - it may be marginal rather than dead,
-            ##  which would make the window a value wider than reported. Tested
-            ##  LAST, so everything useful is measured before the run risks
-            ##  racking the gantry again.
-            todo = list(good) + ([ceiling] if ceiling is not None else [])
+            ##  The value that closed the window is NOT tested.
+            ##
+            ##  It was, briefly. The idea was that one grind does not prove a
+            ##  value always grinds, so testing it might widen the window by
+            ##  one. The cost is up to five more grinds, each able to rack the
+            ##  gantry - and the result cannot be used either way, because a
+            ##  ceiling value can never be the chosen threshold: it sits ON the
+            ##  edge with no margin at all on the side that grinds. Five grinds
+            ##  for a number nothing acts on is not a trade worth offering.
+            todo = list(good)
             scored = []
             for n_v, v in enumerate(todo, 1):
-                grinder = (v == ceiling)
+                grinder = False
                 ##  Gate before EVERY value, not only after the grind. The
                 ##  gantry can shift between tests as easily as during one, and
                 ##  five homes on a gantry that moved describe the movement.
@@ -738,15 +742,7 @@ def sweep(rig, lo, hi, step, chain=True):
                          'Check the gantry is square, then centre the head on %s.'
                          % rig.axis,
                          'Motors are OFF.']
-                if grinder:
-                    lines += ['WARNING: %s=%d GROUND the rail during the sweep.'
-                              % (rig.field, v),
-                              'Testing it shows whether it always does or was',
-                              'merely marginal. Expect up to 5 more grinds, each',
-                              'able to rack the gantry. Cancel is a perfectly',
-                              'good answer here.']
-                else:
-                    lines += ['This value reached the rail during the sweep.']
+                lines += ['This value reached the rail during the sweep.']
                 lines += ['Continue tests it. Cancel stops and keeps every',
                           'result measured so far.']
                 if not ask_operator('Test %s=%d  (%d of %d)'
