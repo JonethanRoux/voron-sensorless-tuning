@@ -516,7 +516,15 @@ class Rig(object):
             post('SET_KINEMATIC_POSITION %s=%.3f' % (self.axis, at))
             time.sleep(0.25)
             self.frame_ok = True
-        elif travel >= self.expected * 0.90:
+        ##  0.90 was too tight. "expected" assumes the head sits exactly at
+        ##  mid-axis, but it is placed BY HAND - a head 22mm off centre homed
+        ##  127.6mm against a 149mm expectation and was rejected, so a perfectly
+        ##  good rail contact went untrusted and the test refused to run.
+        ##
+        ##  The thing being ruled out here is a FALSE trigger, which covers a
+        ##  few millimetres. Anything past 60% of the nominal approach is
+        ##  unambiguously a real approach, and still nowhere near a false trip.
+        elif travel >= self.expected * 0.60:
             ##  No usable p0, so only a long travel proves rail contact. A home
             ##  that TRIGGERED ran the macro's backoff; one that ground did not.
             post('SET_KINEMATIC_POSITION %s=%.3f'
@@ -983,10 +991,12 @@ def verify(rig, sgt, runs, chain=True):
     ##  the rail, this home covers a few millimetres, never anchors, and every
     ##  run after it is a twitch - which is exactly how a value got reported as
     ##  "NO RESULT" having never been tested. Say so immediately and stop.
-    if not getattr(rig, 'frame_ok', False) or _tr0 < rig.expected * 0.5:
+    if not getattr(rig, 'frame_ok', False) or _tr0 < rig.expected * 0.4:
         shout('CANNOT TEST %s=%d - the head is not on the start line.' % (rig.field, sgt))
-        shout('The first home covered %.1fmm, expected about %.0fmm, so it is'
+        shout('The first home covered %.1fmm against about %.0fmm expected, so'
               % (_tr0, rig.expected))
+        shout('the head was roughly %.0fmm from the rail rather than mid-axis.'
+              % _tr0)
         shout('sitting near the rail rather than mid-axis. Centre the head on %s'
               % rig.axis)
         shout('and run VERIFY_%s_HOME again. Nothing about the threshold was'
