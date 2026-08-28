@@ -93,6 +93,15 @@ is:
 
 The tools report all three.
 
+**And the threshold is chosen by measurement, not by rule.** When a sweep finds
+more than one working value it runs a repeatability check on *each* of them and
+picks the one that lands in the same place most consistently. Every value it
+tests already reaches the rail, so this costs a few ordinary homes and no
+grinding. Ties break toward the *less* sensitive end - both ends of a window
+fail as the machine heats, but the sensitive end fails as a **false trigger**,
+which reports success and corrupts the coordinate frame, while the insensitive
+end merely grinds and tells you so.
+
 ## What it is
 
 Two parts:
@@ -542,6 +551,52 @@ licence at the bottom. If it breaks your machine, that is on you.
 
 Things this tool got wrong, kept here rather than quietly rewritten. If a
 measuring tool is going to be trusted, its mistakes have to be on the record.
+
+### Absolute moves computed from a coordinate nothing verified (fixed 2026-08-28)
+
+**This one crashed a machine twice before I found the shape of it.** Three
+separate defects, all the same mistake wearing different clothes: something
+computed an absolute position from a previous *belief* rather than from a
+physical fact, and then drove the head there.
+
+**1. The runway backoff between a double home.** `second_home_dist` backs the
+axis off before the home that counts. The homing moves are monitored and stop
+on contact, but the backoff between them is a plain `G1` that stops on nothing.
+During a threshold sweep, where false triggers are the entire point, that ran
+on every trial: `G28` (trips instantly), `G1 -40`, `G28`, `G1 -10` - about
+**-47mm net per trial**. The gantry walked 150 → 103 → 56 → 9 and into the
+front rail on the fourth. The sweep now suppresses `second_home_dist` and
+`unload_dist` for its duration and restores them before any chained verify.
+
+**2. Reconciling the frame from the previous position.** After a false trigger
+the tool set the axis to `p0 + moved`. When `p0` was itself fiction - inherited
+from an earlier home that false-triggered - the correction inherited the error
+and looked entirely plausible. The head sat ~145mm from where the frame
+claimed, and the next reposition drove **131mm the wrong way** into the
+opposite rail. Guarding "did a correction run" is not the same as "was its
+input real".
+
+**3. The slow version of the same walk.** With repositioning correctly refused
+on an unverified frame, each over-sensitive trial still nets about -8mm (a
+short trip minus the backoff) and nothing puts the head back. Thirty trials
+walks the length of the axis. No per-trial check can see a drift that gradual.
+
+**The fix that worked removed the guessing rather than checking it.** A home
+that covered the expected distance genuinely reached the rail, and its endpoint
+is exactly `position_max` - a hard physical reference needing no prior position.
+`travel` comes only from step counters, so it needs no reference either.
+Anything shorter means the absolute position is **unknowable**, and the honest
+response is to refuse absolute moves, not to invent a coordinate. Plus a
+cumulative drift guard that aborts if the head creeps more than half the axis
+without a single real contact to re-anchor it.
+
+**Correction to the writeup:** I argued publicly that `second_home_dist` was the
+*safe* alternative to `unload_dist`, on the grounds that a homing move stops on
+contact. That was wrong in the part that mattered - the backoff between the two
+homes stops on nothing. Both carry the same hazard.
+
+**If you use `second_home_dist`, know that its backoff is a blind move.** It is
+fine when triggers are trustworthy and dangerous exactly when they are not.
 
 ### Compounding frame corruption in the measured distances (fixed 2026-08-27)
 

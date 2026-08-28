@@ -313,6 +313,9 @@ class Rig(object):
         # there. goto_start() must never back off blindly - from mid-gantry a
         # 150mm back-off drives straight into the opposite rail.
         self.at_rail = False
+        ##  at_rail only says a home RETURNED. frame_ok says the resulting
+        ##  coordinate was actually reconciled against the step counters.
+        self.frame_ok = False
 
     def banner(self):
         say('axis %s   driver %s   field %s   range %d..%d   %s = more sensitive'
@@ -379,7 +382,11 @@ class Rig(object):
         trigger alike - so an absolute move is trustworthy and lands the same
         place every time, which is exactly what the measurement needs.
         """
-        if not self.at_rail:
+        if not self.at_rail or not self.frame_ok:
+            ##  at_rail is True after ANY home that returned, a false trigger
+            ##  included, so on its own it is no evidence this coordinate means
+            ##  anything. Homing from wherever we are is worse for the
+            ##  measurement but cannot crash; an absolute move on a bad frame can.
             return False
         self.ensure_frame()
         post('G90')
@@ -442,8 +449,39 @@ class Rig(object):
         # coordinate that any frame error would shift.
         self.last_moved = raw * self.step_dist
         self.start_pos = p0
-        if p0 is not None:
-            correct_frame(self, p0, raw)
+        ##  Anchor from the RAIL, never from p0.
+        ##
+        ##  correct_frame() computed the position as p0 + moved. When p0 was
+        ##  itself fiction - an earlier home that false-triggered and left
+        ##  Klipper believing position_max - the "correction" inherited that
+        ##  error and looked entirely plausible. The head then sat ~145mm from
+        ##  where the frame claimed, and the next absolute move drove it into
+        ##  the opposite rail. Validating that a correction RAN is not the same
+        ##  as validating its input.
+        ##
+        ##  travel comes only from step counters, so it needs no reference: a
+        ##  home that covered the expected distance genuinely reached the rail,
+        ##  and its endpoint is exactly position_max - a hard physical fact.
+        ##  Anything shorter means the absolute position is UNKNOWABLE, and the
+        ##  honest response is to refuse absolute moves rather than guess one.
+        ##  A GRIND is proof of rail contact too - 458mm of travel on a 300mm
+        ##  axis means it ran the full length and kept pushing. Refusing to
+        ##  anchor there left the head parked against the rail with no way to
+        ##  back off, so a chained verify measured ten 12mm twitches instead of
+        ##  ten 150mm approaches and called a good threshold marginal.
+        ##
+        ##  The two cases park in different places: a home that TRIGGERED ran
+        ##  the macro's backoff afterwards, a home that errored did not.
+        if travel >= self.expected * 0.90:
+            post('SET_KINEMATIC_POSITION %s=%.3f'
+                 % (self.axis, self.pos_max - (self.backoff if ok else 0.0)))
+            time.sleep(0.25)
+            self.frame_ok = True
+        else:
+            if self.frame_ok:
+                say('    false trigger - frame is now UNTRUSTED, no absolute'
+                    ' moves until a home actually reaches the rail')
+            self.frame_ok = False
         post('M400')
         time.sleep(0.4)
         return ok, travel
@@ -483,10 +521,30 @@ def sweep(rig, lo, hi, step, chain=True):
     say('  macro contains seconds of fixed dwell that swamp any timing.')
     say('  Start the head mid-axis. A correct home travels about %.0fmm.' % rig.expected)
     say()
+    ##  A sweep exists to PRODUCE false triggers, and both runway helpers do a
+    ##  blind relative G1 that cannot stop on contact. With second_home_dist=40
+    ##  every trial ran G28, G1 -40, G28, G1 -10 - about -47mm net per trial -
+    ##  which walked the head 150 -> 103 -> 56 -> 9 and into the front rail on
+    ##  the fourth. The second home is only safe when triggers are trustworthy,
+    ##  which during a threshold sweep is exactly what they are not.
+    _v = query('gcode_macro _SENSORLESS_VARS')['gcode_macro _SENSORLESS_VARS']
+    _was_second = _v.get('second_home_dist', 0) or 0
+    _was_unload = _v.get('unload_dist', 0) or 0
+    if float(_was_second) or float(_was_unload):
+        say('  suppressing runway moves for the sweep '
+            '(second_home_dist %s, unload_dist %s -> 0)' % (_was_second, _was_unload))
+        set_var('second_home_dist', 0)
+        set_var('unload_dist', 0)
     good = []
     rig.trail = []          # (value, verdict) for every trial, in order
     val = lo
     known = False
+    ##  Cumulative drift since the last REAL rail contact. Every false trigger
+    ##  nets about -8mm (a short trip minus the 10mm backoff), and with
+    ##  goto_start correctly refusing to reposition on an untrusted frame there
+    ##  is nothing to put the head back. Thirty trials of that walks it the
+    ##  length of the axis. Per-trial checks cannot see a drift this gradual.
+    drift = 0.0
     while (val <= hi if step > 0 else val >= hi):
         rig.set_sgt(val)
         rig.goto_start()
@@ -502,15 +560,93 @@ def sweep(rig, lo, hi, step, chain=True):
             say('        -> working values so far: %s' % good)
             sys.stdout.flush()
         note('%s=%-4d %7.1fmm  %s' % (rig.field, val, travel, verdict))
+        ##  A real rail contact re-anchors everything; otherwise accumulate.
+        if rig.frame_ok:
+            drift = 0.0
+        else:
+            drift += rig.last_moved
+            if drift < -(rig.expected * 0.5):
+                say()
+                say('  ABORTING - the head has crept %.0fmm from the rail across'
+                    ' %d trials' % (drift, len(rig.trail)))
+                say('  without a single real contact to re-anchor it. Every')
+                say('  value tried so far is too sensitive. Restart the sweep')
+                say('  from a LESS sensitive value than %d.' % val)
+                break
+
+        ##  Backstop. If a trial carried the head AWAY from the rail, something
+        ##  is walking it toward the opposite end and the next trials will keep
+        ##  going. Catch it on the first one rather than the fourth.
+        if rig.last_moved < -20.0:
+            say()
+            say('  ABORTING - that trial moved %.1fmm AWAY from the rail.'
+                % rig.last_moved)
+            say('  Something is walking the head toward the opposite end.')
+            say('  Check second_home_dist and unload_dist before re-running.')
+            break
         if verdict == 'FAIL':
             say()
             say('  STOPPING - past this point it only grinds the rail.')
             break
         val += step
+    ##  Restore before any chained verify, so repeatability is measured against
+    ##  the machine's real homing behaviour rather than the sweep's.
+    if float(_was_second) or float(_was_unload):
+        set_var('second_home_dist', _was_second)
+        set_var('unload_dist', _was_unload)
+        say('  runway moves restored (second_home_dist %s, unload_dist %s)'
+            % (_was_second, _was_unload))
     say()
     say('  ' + '-' * 68)
     if good:
+        ##  Which value to use was decided by heuristic - take the middle of the
+        ##  window - on the reasoning that the middle has the most margin either
+        ##  side. That is a fair prior, but it is only a prior: it never checked
+        ##  whether the middle actually repeats best. Measure instead.
+        ##
+        ##  Every value here already reaches the rail, so this costs a handful
+        ##  of ordinary homes and no grinding at all.
         pick = good[len(good) // 2]
+        if len(good) > 1 and chain:
+            say()
+            say('  === repeatability on each of the %d working values ==='
+                % len(good))
+            say('  every value below reaches the rail; this decides which one')
+            say('  lands in the SAME PLACE, which is what actually prints.')
+            scored = []
+            for v in good:
+                mark = len(SUMMARY)
+                try:
+                    verify(rig, v, 5, chain=False)
+                    sp = getattr(rig, 'last_spread', None)
+                except Exception as exc:
+                    say('  %s=%d repeatability failed: %s' % (rig.field, v, exc))
+                    sp = None
+                del SUMMARY[mark:]
+                scored.append((v, sp))
+                say('  -> %s=%-4d spread %s'
+                    % (rig.field, v,
+                       ('%.2fmm' % sp) if sp is not None else 'n/a'))
+            usable = [(v, sp) for v, sp in scored if sp is not None]
+            if usable:
+                ##  Rank by measured spread. Ties break toward the LESS sensitive
+                ##  end: both ends of the window fail as the machine heats, but
+                ##  the sensitive end fails as a FALSE TRIGGER, which reports
+                ##  success and corrupts the coordinate frame, while the
+                ##  insensitive end merely grinds and tells you so.
+                best_sp = min(sp for _v, sp in usable)
+                tied = [v for v, sp in usable if sp <= best_sp + 0.05]
+                pick = max(tied) if rig.sg_sign < 0 else min(tied)
+                note('')
+                note('-- repeatability by threshold --')
+                for v, sp in scored:
+                    note('%s=%-4d spread %s%s'
+                         % (rig.field, v,
+                            ('%.2fmm' % sp) if sp is not None else 'n/a',
+                            '   <- chosen' if v == pick else ''))
+                if len(tied) > 1:
+                    note('tie on spread - took the less sensitive end, which')
+                    note('fails by grinding rather than by lying about position')
         note('PASS  reached the rail at %s' % good)
         note('best  %s = %d' % (rig.field, pick))
         if len(good) == 1:
