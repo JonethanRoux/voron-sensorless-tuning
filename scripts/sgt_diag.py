@@ -435,6 +435,10 @@ class Rig(object):
         ##  after a false trigger. The earlier bug was not that p0 was used, it
         ##  was that p0 was used WITHOUT knowing whether it meant anything.
         trusted_before = bool(self.frame_ok and p0 is not None)
+        ##  How far the rail REALLY is, when we are entitled to say. classify()
+        ##  needs this rather than a fixed assumption, because the head no
+        ##  longer returns to the same start line before every trial.
+        self.last_to_rail = (self.pos_max - p0) if trusted_before else None
         a0, b0 = mcu_steps()
         try:
             post('G28 ' + self.axis)
@@ -518,12 +522,33 @@ class Rig(object):
         return 'LOWER' if self.sg_sign < 0 else 'RAISE'
 
     def classify(self, ok, travel):
-        if not ok or travel > self.expected * 1.25:
-            return 'FAIL'
-        if travel > self.expected * 0.90:
-            return 'GOOD'
+        """GOOD / EARLY / SHORT / FAIL for one homing attempt.
+
+        This used to call anything past expected * 1.25 a FAIL, on the
+        assumption that every trial starts the same distance from the rail.
+        That held while goto_start repositioned before each one. It stopped
+        holding when goto_start began - correctly - refusing to move on a frame
+        it could not verify: after four false triggers the head sits ~32mm
+        further out, and a perfectly good home then covers 210mm and was
+        reported as a grind. A real sweep declared NOTHING WORKED on an axis
+        whose window had already been measured three times.
+
+        A grind does not need to be inferred from distance. StallGuard either
+        fired or it did not, and when it does not Klipper errors out - which is
+        exactly what `ok` carries. Travel only has to separate a trigger that
+        happened at the rail from one that happened on the way there, and for
+        that the reference is how far the rail ACTUALLY was, not how far it is
+        assumed to be.
+        """
+        if not ok:
+            return 'FAIL'           # never triggered: it ground the rail
         if travel < 10:
-            return 'EARLY'
+            return 'EARLY'          # tripped essentially on the spot
+        ##  last_to_rail is the real distance when the frame was trusted going
+        ##  in; otherwise fall back to the nominal mid-axis assumption.
+        ref = getattr(self, 'last_to_rail', None) or self.expected
+        if travel >= ref * 0.90:
+            return 'GOOD'
         return 'SHORT'
 
     def explain(self, verdict):
