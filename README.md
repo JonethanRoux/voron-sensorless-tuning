@@ -538,6 +538,49 @@ emergency stop for the whole run.
 No warranty, and no liability - see the disclaimer at the top and the MIT
 licence at the bottom. If it breaks your machine, that is on you.
 
+## Corrections
+
+Things this tool got wrong, kept here rather than quietly rewritten. If a
+measuring tool is going to be trusted, its mistakes have to be on the record.
+
+### Compounding frame corruption in the measured distances (fixed 2026-08-27)
+
+**If you cloned between commits `ab09d5b` and `bd89c94`, re-pull and re-run
+anything you measured.** The numbers it gave you were wrong in a way that does
+not look wrong.
+
+After a home, the tool reconciled the coordinate frame by inferring where the
+axis must be, starting from where it *believed* the head was before the move.
+When that belief was already wrong the correction inherited the error, judged a
+good home to be false, and rewrote the position around 135mm short. The next
+absolute move then started from that fiction, so the next measurement was worse
+than the last.
+
+It presented as a clean **+2.00mm per run**: smooth, monotonic, and entirely
+plausible as a real physical measurement. That is what made it dangerous. It
+survived my blaming the machine, the autotune plugin, lost steps and a stale
+step-counter read before I found it, and I only caught it because I was asked
+to run the same test twice.
+
+- **Affected:** `MEASURE_X_RAIL` / `MEASURE_Y_RAIL`, and the home-from-a-range-
+  of-distances test. Both called the same bad reconciliation.
+- **Not affected:** the threshold sweep, which compares each attempt against
+  the same starting reference and never went through that path. The tuned
+  thresholds it produced were sound.
+- **Fixed by** anchoring the position to the rail contact that just happened,
+  which is known, instead of inferring it from a prior belief
+  (`cd1eecd`, `bd89c94`).
+
+What it cost: I concluded that Y could not home reliably from close to the rail
+and that a second homing move fixed it. Both were artifacts. With the bug fixed,
+single homing passes from 5, 15, 40, 120 and 250mm, and the rail measures
+300.00mm with 0.00mm spread over five runs. There was nothing to fix. The
+published writeup carries the same correction.
+
+**The general lesson, which outlives this bug:** a measurement that drifts
+smoothly is the hardest kind to distrust. Run anything important twice, from a
+cold start, and compare.
+
 ## Contributing
 
 Improvements welcome - issues and pull requests both. This was written to
