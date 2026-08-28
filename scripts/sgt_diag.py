@@ -1031,8 +1031,8 @@ def coarse_to_fine(rig, lo, hi):
     return sweep(rig, lo, hi, step, chain=False) or []
 
 
-def matrix(axis, accels, currents, lo, hi):
-    """Sweep threshold x accel x current, using RUNTIME changes only.
+def matrix(axis, accels, lo, hi):
+    """Sweep threshold x accel, using RUNTIME changes only.
 
     This deliberately does NOT touch homing_speed. homing_speed is a config
     option with no runtime command, so sweeping it meant rewriting printer.cfg
@@ -1047,16 +1047,31 @@ def matrix(axis, accels, currents, lo, hi):
     report states the speed it ran at so results are never ambiguous.
     """
     results = []
-    speed = Rig(axis).speed
-    total = len(accels) * len(currents)
+    rig0 = Rig(axis)
+    speed = rig0.speed
+    ##  The homing current is REPORTED here, never swept. It used to be iterated
+    ##  and printed in every combination header while never actually being
+    ##  applied - so a report showed three currents for three runs that all ran
+    ##  at the same one, and any difference between them read as a current
+    ##  effect when it was only run-to-run variation. That is how this tool
+    ##  produced "1.0A works, 0.8A and 1.2A do not" from three identical runs.
+    ##  Sweeping it is also the one change an aborted run cannot safely undo,
+    ##  which strands the drivers at the homing current for every later home.
+    ##  Change it deliberately with SET_HOME_CURRENT and re-run: a threshold is
+    ##  only valid at the current it was tuned at.
+    total = len(accels)
     n = 0
     say('  homing_speed is %g (from printer.cfg) and is NOT swept here.' % speed)
     say('  To test another speed, change it, restart, and re-run.')
-    say('  %d combinations: accels %s, currents %s' % (total, accels, currents))
+    say('  homing current is %.2fA and is NOT swept either - see SET_HOME_CURRENT.'
+        % rig0.current)
+    say('  %d combinations: accels %s' % (total, accels))
     say('  threshold range %d..%d, full span, coarse then fine' % (lo, hi))
     say()
     for ac in accels:
-        for cu in currents:
+        ##  Single iteration at the current actually in force. Left as a loop so
+        ##  the body below is untouched; see the note above on why it is not swept.
+        for cu in [rig0.current]:
             n += 1
             post('SET_GCODE_VARIABLE MACRO=_SENSORLESS_VARS '
                  'VARIABLE=%s_home_accel VALUE=%d' % (axis.lower(), ac))
@@ -1447,7 +1462,10 @@ def main():
         # 1000 is in the default list because it is the only accel that has
         # actually produced a working Y window. 500 collapsed it entirely.
         accels = [int(a) for a in _lst('--accels', [1000.0, 1500.0])]
-        currents = _lst('--currents', [0.8, 1.0, 1.2])
+        if _lst('--currents', []):
+            say('  --currents is IGNORED: the homing current is not swept.')
+            say('  An aborted sweep cannot reliably put it back, so set it')
+            say('  with SET_HOME_CURRENT and re-run.')
         rig0 = Rig(axis)
         # Default: the driver's entire range, most sensitive end first.
         lo, hi = int(rig0.sg_start), int(rig0.sg_end)
@@ -1471,14 +1489,14 @@ def main():
         else:
             say('  sweeping the full %s range %d..%d, most sensitive first'
                 % (rig0.drv, lo, hi))
-        combos = len(accels) * len(currents)
+        combos = len(accels)
         per = abs(hi - lo) + 1
         say('  ESTIMATE: %d combinations x ~%d homes = ~%d homes, roughly %d min'
             % (combos, per, combos * per, combos * per * 8 // 60))
-        say('  Narrow it with SPEEDS= ACCELS= CURRENTS= if that is too long.')
+        say('  Narrow it with ACCELS= or SGT_FROM=/SGT_TO= if too long.')
         say('  STOP_SGT_DIAG aborts at any point.')
         say()
-        res = matrix(axis, accels, currents, lo, hi)
+        res = matrix(axis, accels, lo, hi)
         report_matrix(axis, res)
         title = 'SUMMARY - %s PARAMETER MATRIX' % axis
     elif '--range' in args:
