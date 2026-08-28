@@ -584,6 +584,7 @@ def sweep(rig, lo, hi, step, chain=True):
         set_var('second_home_dist', 0)
         set_var('unload_dist', 0)
     good = []
+    ceiling = None          # the value that closed the window, if we found it
     rig.trail = []          # (value, verdict) for every trial, in order
     val = lo
     known = False
@@ -633,6 +634,7 @@ def sweep(rig, lo, hi, step, chain=True):
             say('  Check second_home_dist and unload_dist before re-running.')
             break
         if verdict == 'FAIL':
+            ceiling = val
             ##  A grind proves the head is hard against the rail, so a RELATIVE
             ##  move away from it is safe with no coordinate frame at all. This
             ##  leaves the axis parked mid-travel instead of jammed, which is
@@ -719,11 +721,43 @@ def sweep(rig, lo, hi, step, chain=True):
                 % len(good))
             say('  every value below reaches the rail; this decides which one')
             say('  lands in the SAME PLACE, which is what actually prints.')
+            ##  The value that closed the window is tested too. One grind is
+            ##  not proof it ALWAYS grinds - it may be marginal rather than dead,
+            ##  which would make the window a value wider than reported. Tested
+            ##  LAST, so everything useful is measured before the run risks
+            ##  racking the gantry again.
+            todo = list(good) + ([ceiling] if ceiling is not None else [])
             scored = []
-            for n_v, v in enumerate(good, 1):
+            for n_v, v in enumerate(todo, 1):
+                grinder = (v == ceiling)
+                ##  Gate before EVERY value, not only after the grind. The
+                ##  gantry can shift between tests as easily as during one, and
+                ##  five homes on a gantry that moved describe the movement.
+                lines = ['About to run 5 repeatability homes at %s=%d.'
+                         % (rig.field, v),
+                         'Check the gantry is square, then centre the head on %s.'
+                         % rig.axis,
+                         'Motors are OFF.']
+                if grinder:
+                    lines += ['WARNING: %s=%d GROUND the rail during the sweep.'
+                              % (rig.field, v),
+                              'Testing it shows whether it always does or was',
+                              'merely marginal. Expect up to 5 more grinds, each',
+                              'able to rack the gantry. Cancel is a perfectly',
+                              'good answer here.']
+                else:
+                    lines += ['This value reached the rail during the sweep.']
+                lines += ['Continue tests it. Cancel stops and keeps every',
+                          'result measured so far.']
+                if not ask_operator('Test %s=%d  (%d of %d)'
+                                    % (rig.field, v, n_v, len(todo)), lines):
+                    say('  stopped by operator - keeping %d result(s)'
+                        % len([x for x in scored if x[1] is not None]))
+                    break
+                rig.frame_ok = False   # motors were off; the next home re-anchors
                 say()
                 say('  [%d/%d] %s=%d - 5 homes ...'
-                    % (n_v, len(good), rig.field, v))
+                    % (n_v, len(todo), rig.field, v))
                 mark = len(SUMMARY)
                 try:
                     verify(rig, v, 5, chain=False)
@@ -736,7 +770,9 @@ def sweep(rig, lo, hi, step, chain=True):
                 ##  Everything worth reading goes HERE, after the runs. Put it
                 ##  before and it scrolls past behind the per-run lines and the
                 ##  number you actually came for arrives on its own.
-                where = ('MOST SENSITIVE of the working values - nearest the'
+                where = ('CEILING - the value that closed the window'
+                         if v == ceiling else
+                         'MOST SENSITIVE of the working values - nearest the'
                          ' false-trigger edge' if v == min(good) else
                          'LEAST SENSITIVE of the working values - nearest the'
                          ' grinding edge' if v == max(good) else
@@ -760,9 +796,13 @@ def sweep(rig, lo, hi, step, chain=True):
                 if len(done) > 1:
                     b = min(done, key=lambda x: x[1])
                     say('  BEST    so far %s=%d at %.2fmm  (%d of %d tested)'
-                        % (rig.field, b[0], b[1], len(scored), len(good)))
+                        % (rig.field, b[0], b[1], len(scored), len(todo)))
                 say('  ' + '=' * 60)
-            usable = [(v, sp) for v, sp in scored if sp is not None]
+            ##  A ceiling value can post a fine spread and still be the wrong
+            ##  answer: it sits ON the edge, with no margin at all on the side
+            ##  that grinds. Measured for information, never chosen.
+            usable = [(v, sp) for v, sp in scored
+                      if sp is not None and v in good]
             if usable:
                 ##  Rank by measured spread. Ties break toward the LESS sensitive
                 ##  end: both ends of the window fail as the machine heats, but
