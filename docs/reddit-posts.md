@@ -44,7 +44,7 @@ A few other things that cost me hours:
 
 Full writeup with the numbers, and an MIT tool that does the measuring:
 
-https://klipper.discourse.group/t/sensorless-homing-five-things-that-cost-me-a-day-and-a-tool-that-measures-them/26260
+https://klipper.discourse.group/t/klipper-sensorless-homing-false-triggers-repeatability-and-why-one-working-threshold-isnt-tuned-corexy-tmc5160/26260
 
 Tested on one machine only, panels off, cold. Happy to be told I have any of it
 wrong.
@@ -92,7 +92,7 @@ Two smaller ones:
 
 Writeup and an MIT tool that measures all of it:
 
-https://klipper.discourse.group/t/sensorless-homing-five-things-that-cost-me-a-day-and-a-tool-that-measures-them/26260
+https://klipper.discourse.group/t/klipper-sensorless-homing-false-triggers-repeatability-and-why-one-working-threshold-isnt-tuned-corexy-tmc5160/26260
 
 Is the frame behaviour after a false trigger considered expected, or worth
 raising upstream? Genuinely unsure.

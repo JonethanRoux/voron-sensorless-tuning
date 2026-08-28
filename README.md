@@ -12,6 +12,10 @@ config claims.
 
 Driver-agnostic: it detects which StallGuard generation is fitted and adapts.
 
+The findings behind it, with the numbers and a correction to one of them, are
+written up here: [Klipper sensorless homing: false triggers, repeatability, and
+why one working threshold isn't tuned](https://klipper.discourse.group/t/klipper-sensorless-homing-false-triggers-repeatability-and-why-one-working-threshold-isnt-tuned-corexy-tmc5160/26260).
+
 ## Symptoms this is meant to diagnose
 
 If any of these describe your machine, this is the right tool. They are all the
