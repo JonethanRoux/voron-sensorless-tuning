@@ -623,20 +623,58 @@ def sweep(rig, lo, hi, step, chain=True):
             ##  A grind does not only cost the axis being swept. On CoreXY the
             ##  carriage is blocked while both motors keep stepping, so A and B
             ##  skip by DIFFERENT amounts - and since y = (a - b) / 2, that
-            ##  difference is a real Y movement. The belts also redistribute
-            ##  tension against a blocked carriage and drag the gantry. The
-            ##  other axis is therefore no longer where Klipper thinks either.
+            ##  difference is a real movement of the OTHER axis. The belts also
+            ##  redistribute tension against a blocked carriage and drag the
+            ##  gantry out of square.
+            ##
+            ##  Warning about that and then measuring anyway is worse than not
+            ##  warning: the repeatability runs that follow describe the skew
+            ##  rather than the threshold. One such run reported a 197mm
+            ##  "spread", which is not a number any threshold can produce, and
+            ##  on that basis it would have discarded a good value.
+            ##
+            ##  Homing the other axis drives the gantry into both its rails,
+            ##  which is what physically squares a CoreXY gantry. Do it at the
+            ##  KNOWN-GOOD config threshold, never the value that just ground.
             other = 'Y' if rig.axis == 'X' else 'X'
             say()
-            say('  NOTE: that grind may have racked the gantry in %s.' % other)
-            say('  On CoreXY a blocked carriage makes both motors skip, and')
-            say('  unequal skid between them moves the OTHER axis. %s is no' % other)
-            say('  longer where Klipper believes - re-home it before trusting')
-            say('  any %s coordinate.' % other)
+            say('  that grind racked the gantry in %s - squaring it before' % other)
+            say('  anything else is measured.')
+            rig.set_sgt(rig.sgt_cfg)
+            recovered = True
             try:
-                post('SET_KINEMATIC_POSITION')   # no axis given: nothing moves
-            except Exception:
-                pass
+                post('G28 %s' % other)      # gantry into its rails: de-racks
+                time.sleep(0.6)
+                post('G28 %s' % rig.axis)   # then re-establish this axis
+                time.sleep(0.6)
+            except Exception as exc:
+                recovered = False
+                say('  RECOVERY FAILED: %s' % exc)
+            if recovered:
+                rig.frame_ok = True
+                say('  re-homed, frame re-anchored from a real home')
+                if chain:
+                    ##  Re-homing SHOULD have squared it. The tool cannot verify
+                    ##  that, and measuring a skewed gantry produces confident
+                    ##  nonsense, so this is the operator's call.
+                    ok_go = ask_operator(
+                        'Check the gantry before measuring',
+                        ['sgt=%d ground the rail, which can rack the gantry.' % val,
+                         'It has been re-homed, but that is not proof it is square.',
+                         'Check both gantry ends sit evenly and move freely,',
+                         'then centre the head.',
+                         'Continue runs %d repeatability tests. Cancel keeps the'
+                         ' window result and stops.' % len(good)])
+                    if not ok_go:
+                        chain = False
+                    else:
+                        rig.frame_ok = False   # motors were off; re-anchor by homing
+            else:
+                ##  Better to report nothing than to report the skew.
+                chain = False
+                say('  NOT measuring on a racked gantry. The window above is')
+                say('  still valid - only the repeatability comparison is')
+                say('  skipped. Re-home by hand and re-run to get it.')
             say('  STOPPING - past this point it only grinds the rail.')
             break
         val += step
@@ -1416,6 +1454,56 @@ def failure_advice(axis, rig, why):
     note('   belts, pulleys and grub screws are all exonerated by it.')
     note('   What is NOT shared: that axis own linear rails, and on Y the')
     note('   whole gantry mass it alone has to drag.')
+
+
+def ask_operator(title, lines, timeout=1800.0):
+    """Drop the motors, put a dialog on the operator's screen, and WAIT.
+
+    Returns True to continue, False to cancel.
+
+    This exists because the tool cannot see what it did to the machine. A grind
+    racks the gantry, and whether it came back square is a question only a human
+    standing at the printer can answer. Guessing produced a 197mm "spread" once
+    and would have thrown away a good threshold on the strength of it.
+
+    Motors are released first so the gantry can be squared by hand, which is the
+    whole point of stopping here.
+    """
+    post('SET_GCODE_VARIABLE MACRO=_SGT_GATE VARIABLE=go VALUE=0')
+    post('M84')
+    post('RESPOND TYPE=command MSG="action:prompt_begin %s"' % title)
+    for ln in lines:
+        post('RESPOND TYPE=command MSG="action:prompt_text %s"' % ln)
+    post('RESPOND TYPE=command MSG='
+         '"action:prompt_footer_button Continue|SGT_CONTINUE|primary"')
+    post('RESPOND TYPE=command MSG='
+         '"action:prompt_footer_button Cancel|SGT_ABORT|error"')
+    post('RESPOND TYPE=command MSG="action:prompt_show"')
+    say()
+    say('  ' + '=' * 60)
+    say('  WAITING FOR YOU - %s' % title)
+    for ln in lines:
+        say('  %s' % ln)
+    say('  Motors are OFF. Square the gantry by hand, then answer the popup,')
+    say('  or run  SGT_CONTINUE  /  SGT_ABORT  from the console.')
+    say('  ' + '=' * 60)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2.0)
+        try:
+            g = query('gcode_macro _SGT_GATE')['gcode_macro _SGT_GATE']
+            go = int(float(g.get('go', 0) or 0))
+        except Exception:
+            continue
+        if go == 1:
+            say('  -> continuing')
+            return True
+        if go == 2:
+            say('  -> cancelled by operator')
+            return False
+    post('RESPOND TYPE=command MSG="action:prompt_end"')
+    say('  -> no answer in %.0f minutes, cancelling' % (timeout / 60.0))
+    return False
 
 
 def set_var(name, value):
