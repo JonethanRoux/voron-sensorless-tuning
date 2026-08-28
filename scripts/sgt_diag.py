@@ -638,13 +638,17 @@ def sweep(rig, lo, hi, step, chain=True):
             ##  leaves the axis parked mid-travel instead of jammed, which is
             ##  what the chained repeatability test needs - and saves having to
             ##  re-centre by hand between the sweep and the verify.
-            say()
-            say('  backing off the rail (relative move, no frame needed)')
-            post('G91')
-            post('G1 %s-%.1f F3000' % (rig.axis, rig.expected))
-            post('G90')
-            post('M400')
-            time.sleep(0.5)
+            ##  There WAS a blind relative backoff here - G1 -150 - argued safe
+            ##  because "a grind proves the head is against the rail". It does
+            ##  not. It proves the CLASSIFIER said so, and the classifier was
+            ##  wrong: it called a genuine 210mm home a grind because the head
+            ##  had drifted further from the rail than assumed. Backing off
+            ##  150mm from mid-axis then drove the head into the opposite end.
+            ##
+            ##  The move was never needed. The gate below releases the motors
+            ##  and asks the operator to square and centre by hand anyway, so
+            ##  the tool was taking a risk to save a step it does not save.
+            ##  When in doubt, do not move: ask.
             ##  A grind does not only cost the axis being swept. On CoreXY the
             ##  carriage is blocked while both motors keep stepping, so A and B
             ##  skip by DIFFERENT amounts - and since y = (a - b) / 2, that
@@ -977,10 +981,9 @@ def distances(rig, dists, chain=True, runs=10):
     bad = []
     for d in dists:
         rig.ensure_frame()
-        post('G90')
-        post('G1 %s%.1f F6000' % (rig.axis, rig.pos_max - d))
-        post('M400')
-        time.sleep(0.5)
+        if not safe_abs(rig, rig.pos_max - d, 'placing the head %.0fmm out' % d):
+            say('    cannot place the head for the %.0fmm test - skipping it' % d)
+            continue
         rig.at_rail = True
         p0 = axis_pos(rig.axis)
         a0, b0 = mcu_steps()
@@ -1109,13 +1112,14 @@ def measure_axis(rig, runs=10):
     ##  home re-anchors the frame the hard way.
     post('SET_KINEMATIC_POSITION %s=%.3f' % (rig.axis, rig.pos_max - rig.backoff))
     time.sleep(0.4)
+    ##  Anchored to a real rail contact, so the frame is trustworthy again.
+    rig.frame_ok = True
     res = []
     for i in range(1, runs + 1):
         rig.ensure_frame()
-        post('G90')
-        post('G1 %s%.1f F6000' % (rig.axis, pmin))
-        post('M400')
-        time.sleep(0.6)
+        if not safe_abs(rig, pmin, 'moving to the far end to measure the rail'):
+            say('    frame unverified - stopping the rail measurement here')
+            break
         rig.at_rail = True
         p0 = axis_pos(rig.axis)
         a0, b0 = mcu_steps()
@@ -1265,14 +1269,16 @@ def park_centre(rig):
         homed = False
     try:
         if not homed:
-            say('  %s ended against the rail unhomed - declaring %.0f, then centring'
-                % (rig.axis, rig.pos_max))
-            post('SET_KINEMATIC_POSITION %s=%.1f' % (rig.axis, rig.pos_max))
-            time.sleep(0.3)
-        post('G90')
-        post('G1 %s%.1f F6000' % (rig.axis, mid))
-        post('M400')
-        time.sleep(0.5)
+            ##  This used to DECLARE the axis at position_max, reasoning that it
+            ##  "ended against the rail", and then move on that. It is a guess,
+            ##  and parking is a convenience - never worth a guess that can send
+            ##  the head the length of the axis.
+            say('  %s is unhomed and its position is unknown - not parking.'
+                % rig.axis)
+            say('  The head stays where it is; the next home will place it.')
+            return
+        rig.frame_ok = True
+        safe_abs(rig, mid, 'parking at centre')
         return True
     except urllib.error.HTTPError:
         say('  could not park %s at centre - hand-centre it before the next run'
@@ -1467,6 +1473,27 @@ def failure_advice(axis, rig, why):
     note('   belts, pulleys and grub screws are all exonerated by it.')
     note('   What is NOT shared: that axis own linear rails, and on Y the')
     note('   whole gantry mass it alone has to drag.')
+
+
+def safe_abs(rig, coord, why):
+    """Absolute move, but only on a frame something actually verified.
+
+    Every crash this tool has caused was an absolute move computed from a
+    coordinate nothing had checked. Guarding goto_start() fixed one instance and
+    left the identical pattern in three other functions, so it is a helper now
+    and there is exactly one place to get it right.
+
+    Refusing is always safe: the head stays put and the next homing move
+    re-establishes the frame honestly. Moving on a bad frame is not.
+    """
+    if not getattr(rig, 'frame_ok', False):
+        say('    (skipping %s - frame unverified, staying put)' % why)
+        return False
+    post('G90')
+    post('G1 %s%.1f F6000' % (rig.axis, coord))
+    post('M400')
+    time.sleep(0.5)
+    return True
 
 
 def ask_operator(title, lines, timeout=1800.0):
