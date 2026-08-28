@@ -1457,7 +1457,25 @@ def ask_operator(title, lines, timeout=1800.0):
     Motors are released first so the gantry can be squared by hand, which is the
     whole point of stopping here.
     """
-    post('SET_GCODE_VARIABLE MACRO=_SGT_GATE VARIABLE=go VALUE=0')
+    ##  The gate macros live in sensorless_tools.cfg. Anyone who updates this
+    ##  script without updating their config would otherwise hit an exception
+    ##  HERE - mid-sweep, straight after a grind - which is the worst possible
+    ##  moment for the safety feature itself to be the thing that fails.
+    ##
+    ##  Missing macros must therefore fail SAFE: stop, do not measure, and say
+    ##  exactly what to install. Never silently carry on past a gate.
+    try:
+        post('SET_GCODE_VARIABLE MACRO=_SGT_GATE VARIABLE=go VALUE=0')
+    except Exception:
+        post('M84')
+        say()
+        say('  ' + '=' * 60)
+        say('  STOPPING - cannot ask you, so I will not guess.')
+        say('  This needs the _SGT_GATE / SGT_CONTINUE / SGT_ABORT macros from')
+        say('  sensorless_tools.cfg. Your config predates them, so update it')
+        say('  and RESTART. Motors are off; the result so far is kept.')
+        say('  ' + '=' * 60)
+        return False
     post('M84')
     post('RESPOND TYPE=command MSG="action:prompt_begin %s"' % title)
     for ln in lines:
@@ -1482,6 +1500,8 @@ def ask_operator(title, lines, timeout=1800.0):
             g = query('gcode_macro _SGT_GATE')['gcode_macro _SGT_GATE']
             go = int(float(g.get('go', 0) or 0))
         except Exception:
+            ##  A restart or a Klipper error while we wait. Keep waiting rather
+            ##  than treating a transient query failure as consent.
             continue
         if go == 1:
             say('  -> continuing')
