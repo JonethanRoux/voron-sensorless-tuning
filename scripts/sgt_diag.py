@@ -973,7 +973,30 @@ def verify(rig, sgt, runs, chain=True):
     ##  run when repeatability passes.
     if getattr(rig, 'frame_ok', False):
         safe_abs(rig, rig.pos_max - rig.expected, 'placing on the start line')
-    rig.one_home()
+    ##  The anchoring home. Its job is to establish where the rail is, and it can
+    ##  only do that from a head that was actually placed mid-axis.
+    _ok0, _tr0 = rig.one_home()
+    ##  Check NOW, not after five wasted runs.
+    ##
+    ##  After a gate the motors are released and the head may have been moved, so
+    ##  the frame is untrusted and nothing repositions. If the head was left at
+    ##  the rail, this home covers a few millimetres, never anchors, and every
+    ##  run after it is a twitch - which is exactly how a value got reported as
+    ##  "NO RESULT" having never been tested. Say so immediately and stop.
+    if not getattr(rig, 'frame_ok', False) or _tr0 < rig.expected * 0.5:
+        shout('CANNOT TEST %s=%d - the head is not on the start line.' % (rig.field, sgt))
+        shout('The first home covered %.1fmm, expected about %.0fmm, so it is'
+              % (_tr0, rig.expected))
+        shout('sitting near the rail rather than mid-axis. Centre the head on %s'
+              % rig.axis)
+        shout('and run VERIFY_%s_HOME again. Nothing about the threshold was'
+              % rig.axis)
+        shout('measured - this is a placement problem, not an axis problem.')
+        note('-- repeatability --')
+        note('%s=%d  NOT TESTED - head was not centred, %.0fmm first home'
+             % (rig.field, sgt, _tr0))
+        rig.last_spread = None
+        return
     res = []
     for i in range(1, runs + 1):
         rig.goto_start()
