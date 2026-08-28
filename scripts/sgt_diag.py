@@ -726,6 +726,9 @@ def sweep(rig, lo, hi, step, chain=True):
     say()
     say('  ' + '-' * 68)
     if good:
+        ##  NOTE ON WINDOW WIDTH: len(good) counts values that REACHED THE RAIL.
+        ##  That is not the same as values you can print with - see the width
+        ##  report below, which counts the ones that also repeat.
         ##  Which value to use was decided by heuristic - take the middle of the
         ##  window - on the reasoning that the middle has the most margin either
         ##  side. That is a fair prior, but it is only a prior: it never checked
@@ -827,6 +830,29 @@ def sweep(rig, lo, hi, step, chain=True):
                 best_sp = min(sp for _v, sp in usable)
                 tied = [v for v, sp in usable if sp <= best_sp + 0.05]
                 pick = max(tied) if rig.sg_sign < 0 else min(tied)
+                ##  The REAL window width.
+                ##
+                ##  Width was counted from how many values reached the rail, and
+                ##  reported as the margin you have against a hot chamber. A
+                ##  real run then measured [0, 1, 2] as "three wide" while sgt=2
+                ##  scattered 21.2mm - it reaches the rail every time and prints
+                ##  as a layer shift. Rail contact is not usability, and quoting
+                ##  it as margin overstates the margin badly.
+                usable_vals = sorted(v for v, sp in usable if sp < 1.0)
+                note('')
+                note('-- window width --')
+                note('reached the rail : %d value(s)  %s' % (len(good), good))
+                note('actually usable  : %d value(s)  %s  (spread under 1mm)'
+                     % (len(usable_vals), usable_vals or 'none'))
+                if len(usable_vals) < len(good):
+                    note('NOTE  %d value(s) reached the rail but do NOT repeat.'
+                         % (len(good) - len(usable_vals)))
+                    note('      Margin is the USABLE count, not the rail count.')
+                if len(usable_vals) <= 1:
+                    note('WARN  one usable value is no margin at all. It works')
+                    note('      cold and fails warm - StallGuard drifts with')
+                    note('      motor temperature. Change homing_speed or')
+                    note('      home_current and re-run to widen it.')
                 note('')
                 note('-- repeatability by threshold --')
                 for v, sp in scored:
@@ -936,6 +962,17 @@ def verify(rig, sgt, runs, chain=True):
     say('  homing once first to reach the rail, then backing off %.0fmm before each run'
           % rig.expected)
     say()
+    ##  Place the head on the start line BEFORE the first home.
+    ##
+    ##  Without this the first home runs from wherever the previous test left
+    ##  the head - which after a sweep is hard against the rail. That home then
+    ##  covers a few millimetres instead of ~150, and every run after it starts
+    ##  from the same place, so the test measures ten short twitches, reports a
+    ##  0.00mm spread on a 10mm mean, and calls a good threshold a failure. It
+    ##  also broke the chain to the home-range and rail measurements, which only
+    ##  run when repeatability passes.
+    if getattr(rig, 'frame_ok', False):
+        safe_abs(rig, rig.pos_max - rig.expected, 'placing on the start line')
     rig.one_home()
     res = []
     for i in range(1, runs + 1):
@@ -949,6 +986,22 @@ def verify(rig, sgt, runs, chain=True):
         sys.stdout.flush()
     spread = max(res) - min(res)
     mean = sum(res) / len(res)
+    ##  A mean far below the expected approach means the head never had room to
+    ##  run - the runs are twitches off the rail, not homes. That is a broken
+    ##  MEASUREMENT, not a broken threshold, and reporting it as a failure sends
+    ##  people re-tuning a value that was never tested.
+    if mean < rig.expected * 0.5:
+        say()
+        shout('MEASUREMENT INVALID - mean travel %.1fmm, expected about %.0fmm'
+              % (mean, rig.expected))
+        shout('The head was too close to the rail to approach it properly, so')
+        shout('these runs are twitches rather than homes. The threshold was NOT')
+        shout('tested. Centre the head and run VERIFY_%s_HOME again.' % rig.axis)
+        note('-- repeatability --')
+        note('%s=%d  INVALID - head too close to the rail, not a threshold result'
+             % (rig.field, sgt))
+        rig.last_spread = None
+        return
     say()
     say('  ' + '-' * 68)
     say('  spread %.2fmm over %d runs   (mean travel %.1fmm, expected %.0fmm)'

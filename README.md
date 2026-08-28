@@ -86,7 +86,11 @@ is:
   different each time. That prints as a layer shift, not as an obvious failure.
 - **How wide is the working window?** If exactly one integer works, it will
   work cold and fail warm. StallGuard drifts with motor temperature, so a
-  one-value-wide window has no margin for a machine that heats up.
+  one-value-wide window has no margin for a machine that heats up. Width is
+  counted from values that **repeat**, not values that merely reach the rail -
+  a real machine measured three values reaching the rail, of which one
+  scattered 21mm. It stopped at the rail every time and would have printed as
+  a layer shift. Rail contact is not usability.
 - **Is the travel real?** If the measured rail-to-rail distance is shorter than
   `position_max - position_min`, your config claims travel the machine does not
   have, and every print is squeezed into a frame that does not exist.
