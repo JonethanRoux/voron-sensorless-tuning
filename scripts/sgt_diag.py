@@ -179,6 +179,25 @@ def say(msg=''):
         pass    # console output is a convenience, never fail a test over it
 
 
+def shout(msg):
+    """Console output that survives the noise.
+
+    say() already mirrors to the console, but the console is full of the
+    GET_POSITION dumps this script issues twice per home to read step counters,
+    so an ordinary line scrolls past between them. Anything the operator has to
+    ACT on - a gate, a stop - goes out as TYPE=error, which Mainsail and Fluidd
+    colour and keep visible, and onto the printer's own status line via M117.
+    """
+    print(msg)
+    sys.stdout.flush()
+    try:
+        clean = msg.replace('"', "'")
+        if clean.strip():
+            post('RESPOND TYPE=error MSG="%s"' % clean, timeout=20)
+    except Exception:
+        pass
+
+
 def query(objs):
     # Encode, for the same reason post() does. Object names such as
     # 'gcode_macro _SENSORLESS_VARS' contain a space, and http.client rejects a
@@ -1574,13 +1593,18 @@ def ask_operator(title, lines, timeout=1800.0):
          '"action:prompt_footer_button Cancel|SGT_ABORT|error"')
     post('RESPOND TYPE=command MSG="action:prompt_show"')
     say()
-    say('  ' + '=' * 60)
-    say('  WAITING FOR YOU - %s' % title)
+    shout('=' * 58)
+    shout('PAUSED - %s' % title)
     for ln in lines:
-        say('  %s' % ln)
-    say('  Motors are OFF. Square the gantry by hand, then answer the popup,')
-    say('  or run  SGT_CONTINUE  /  SGT_ABORT  from the console.')
-    say('  ' + '=' * 60)
+        shout('  ' + ln)
+    shout('MOTORS ARE OFF. Square the gantry, centre the head, then run:')
+    shout('    SGT_CONTINUE     to run this test')
+    shout('    SGT_ABORT        to stop and keep what is measured')
+    shout('=' * 58)
+    try:
+        post('M117 PAUSED - SGT_CONTINUE or SGT_ABORT')
+    except Exception:
+        pass
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(2.0)
@@ -1592,10 +1616,14 @@ def ask_operator(title, lines, timeout=1800.0):
             ##  than treating a transient query failure as consent.
             continue
         if go == 1:
-            say('  -> continuing')
+            shout('resuming')
+            try:
+                post('M117 running')
+            except Exception:
+                pass
             return True
         if go == 2:
-            say('  -> cancelled by operator')
+            shout('cancelled by operator')
             return False
     post('RESPOND TYPE=command MSG="action:prompt_end"')
     say('  -> no answer in %.0f minutes, cancelling' % (timeout / 60.0))
