@@ -12,6 +12,41 @@ config claims.
 
 Driver-agnostic: it detects which StallGuard generation is fitted and adapts.
 
+## Symptoms this is meant to diagnose
+
+If any of these describe your machine, this is the right tool. They are all the
+same underlying problem - a StallGuard threshold that triggers on something
+other than the rail - and they are listed in the words people actually search
+for, because it took me a while to work out they were one fault and not six.
+
+- **Homing succeeds, then the very next move crashes into the opposite side.**
+  The home was false, Klipper set the axis to `position_max` anyway, and the
+  return move was computed from a position the head was never at. This looks
+  exactly like an inverted direction and is not.
+- **`Move out of range`** immediately after a home that appeared to work.
+- **`Endstop x still triggered after retract`** - the stall flag is still set
+  after the backoff, which usually means the threshold is far too sensitive.
+- **Layer shifts**, or a first layer that starts a few millimetres off, on a
+  machine whose belts and grub screws are fine.
+- **Homes reliably cold and fails once the chamber is warm.** StallGuard drifts
+  with motor temperature, so a threshold with a one-value-wide working window
+  has no margin left by the time the printer is hot.
+- **Exactly one threshold value works** and both neighbours fail, so every
+  change to current, speed or accel breaks it again.
+- **It grinds into the rail and never triggers** at any threshold you have
+  tried.
+- **One axis is fine and the other is not** on a CoreXY, which narrows the
+  cause far more than the usual advice admits - see
+  [On CoreXY, a passing axis exonerates the drivetrain](#on-corexy-a-passing-axis-exonerates-the-drivetrain).
+- **It homes, but you have never checked whether it homes to the *same place*
+  twice.** A single successful home proves almost nothing. Mine reached the
+  rail ten times out of ten and still wandered 3.54mm.
+
+Tested on a Voron 2.4 (CoreXY, TMC5160, 48V). Written to work with StallGuard2
+(`driver_SGT`, TMC2130/5160/5161) and StallGuard4 (`driver_SGTHRS`,
+TMC2209/2240), which run on **opposite** sensitivity scales - see
+[Driver support](#driver-support).
+
 > **Tune X first, always.** Not a preference - it changes what a Y result
 > means. X moves only the toolhead, so a failed value grinds far more gently
 > than one that drives the whole gantry. More importantly, on CoreXY both
